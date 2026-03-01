@@ -21,9 +21,12 @@ To update: in Package Manager select the package → **Update** (or change the v
 
 ### Option 2: Copy sources into Assets
 
+All source files (`.cs` scripts, etc.) live in the **repo root** — there is no `Assets/Editor` folder in the repo.
+
 1. Clone or download this repo.
-2. Copy the **`Assets/Editor`** folder (with all `.cs` scripts and the Editor README) into your Unity project’s **`Assets`** folder, e.g. so you have `YourProject/Assets/Editor/...`.
-3. Unity will compile the scripts and add **Tools → Babylon NPE → Export Shuriken to Node Particle Editor JSON** to the menu.
+2. In your Unity project, create a folder **`Assets/Editor`** if it doesn’t exist.
+3. Copy all source files from the repo root (e.g. `ShurikenToNpeConverter.cs`, `BabylonNodeParticleModels.cs`, `NpeJsonWriter.cs`, `ShurikenToBabylonNpeWindow.cs`, and any other `.cs` / editor files) into **`YourProject/Assets/Editor/`**.
+4. Unity will compile the scripts and add **Tools → Babylon NPE → Export Shuriken to Node Particle Editor JSON** to the menu.
 
 ---
 

@@ -173,18 +173,13 @@ namespace ShurikenToBabylonNpe
         static string GetTextureDataUrl(Texture tex)
         {
             if (tex == null)
-            {
-                UnityEngine.Debug.Log("[ShurikenToNpe] GetTextureDataUrl: texture is null.");
                 return null;
-            }
-            UnityEngine.Debug.Log($"[ShurikenToNpe] GetTextureDataUrl: '{tex.name}' type={tex.GetType().Name}");
             Texture2D t2d = tex as Texture2D;
             bool tempCreated = false;
             if (t2d == null)
             {
                 if (tex is RenderTexture rt)
                 {
-                    UnityEngine.Debug.Log($"[ShurikenToNpe] Reading from RenderTexture {rt.width}x{rt.height}");
                     RenderTexture prev = RenderTexture.active;
                     RenderTexture.active = rt;
                     t2d = new Texture2D(rt.width, rt.height, TextureFormat.RGBA32, false);
@@ -194,14 +189,7 @@ namespace ShurikenToBabylonNpe
                     tempCreated = true;
                 }
                 else
-                {
-                    UnityEngine.Debug.Log($"[ShurikenToNpe] Texture is not Texture2D or RenderTexture, cannot encode.");
                     return null;
-                }
-            }
-            else if (!t2d.isReadable)
-            {
-                UnityEngine.Debug.Log($"[ShurikenToNpe] Texture2D '{t2d.name}' is not readable; copying via RenderTexture.");
             }
             // Use Blit path for compressed or non-readable Texture2D (EncodeToPNG does not support compressed formats).
             bool useBlitPath = t2d != null && !tempCreated && (!t2d.isReadable || (t2d.format != TextureFormat.RGBA32 && t2d.format != TextureFormat.ARGB32));
@@ -225,18 +213,13 @@ namespace ShurikenToBabylonNpe
                 if (tempCreated && t2d != null)
                     UnityEngine.Object.DestroyImmediate(t2d);
                 if (png == null || png.Length == 0)
-                {
-                    UnityEngine.Debug.Log("[ShurikenToNpe] EncodeToPNG returned null or empty.");
                     return null;
-                }
-                UnityEngine.Debug.Log($"[ShurikenToNpe] Texture encoded to PNG, {png.Length} bytes");
                 return "data:image/png;base64," + System.Convert.ToBase64String(png);
             }
-            catch (System.Exception e)
+            catch (System.Exception)
             {
                 if (tempCreated && t2d != null)
                     UnityEngine.Object.DestroyImmediate(t2d);
-                UnityEngine.Debug.LogException(e);
                 return null;
             }
         }
@@ -272,33 +255,22 @@ namespace ShurikenToBabylonNpe
             var sizeBySpeed = ps.sizeBySpeed;
             var rotationBySpeed = ps.rotationBySpeed;
             var renderer = ps.GetComponent<ParticleSystemRenderer>();
-            UnityEngine.Debug.Log($"[ShurikenToNpe] ParticleSystem '{ps.name}': renderer={(renderer != null ? renderer.name : "null")}");
             UnityEngine.Material mat = renderer != null ? renderer.sharedMaterial : null;
-            if (mat == null)
-                UnityEngine.Debug.Log("[ShurikenToNpe] No material on renderer (sharedMaterial is null).");
-            else
-                UnityEngine.Debug.Log($"[ShurikenToNpe] Material '{mat.name}', shader '{mat.shader?.name}'");
             // Only the albedo (main) texture from the material is needed; material itself is not used in NPE
             Texture tex = null;
             if (mat != null)
             {
                 tex = mat.GetTexture("_MainTex");
-                UnityEngine.Debug.Log($"[ShurikenToNpe] _MainTex: {(tex != null ? tex.name + " (" + tex.GetType().Name + ")" : "null")}");
                 if (tex == null)
-                {
                     tex = mat.mainTexture;
-                    UnityEngine.Debug.Log($"[ShurikenToNpe] mainTexture: {(tex != null ? tex.name + " (" + tex.GetType().Name + ")" : "null")}");
-                }
                 if (tex == null)
                 {
                     var names = new List<string>();
                     mat.GetTexturePropertyNames(names);
-                    UnityEngine.Debug.Log($"[ShurikenToNpe] Material texture property names: [{string.Join(", ", names)}]");
                     foreach (string prop in names)
                     {
                         var t = mat.GetTexture(prop);
-                        if (t != null)
-                            UnityEngine.Debug.Log($"[ShurikenToNpe]   {prop} => {t.name} ({t.GetType().Name})");
+                        if (t != null) { tex = t; break; }
                     }
                 }
             }
