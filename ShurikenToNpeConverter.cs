@@ -125,10 +125,17 @@ namespace ShurikenToBabylonNpe
             return total > 0 ? total : -1;
         }
 
-        /// <summary>Get NPE blend mode from Unity material. Uses Blending Mode / Rendering Mode properties (_BlendMode, _Blend, _Mode, or _SrcBlend/_DstBlend). Not material name. Color Mode is particle*material blend, not scene blend.</summary>
+        /// <summary>Get NPE blend mode from Unity material. Checks _ColorMode (particle Color Mode), then _BlendMode / _Blend (Rendering Mode), then _SrcBlend/_DstBlend.</summary>
         static int GetBlendModeFromUnity(Material mat)
         {
             if (mat == null) return BlendCombine;
+            // 0) Particle Color Mode (Multiply/Additive) — often drives the actual blend in particle shaders (Rendering Mode Fade + Color Mode Multiply => multiply blend)
+            if (mat.HasProperty("_ColorMode"))
+            {
+                int c = (int)mat.GetFloat("_ColorMode");
+                if (c == 1) return BlendAdditive;   // Additive
+                if (c == 0) return BlendMultiply;   // Multiply (common value for Multiply in particle shaders)
+            }
             // 1) URP Particles Unlit / Lit: Blending Mode = _BlendMode (0=Alpha, 1=Premultiply, 2=Additive, 3=Multiply)
             if (mat.HasProperty("_BlendMode"))
             {
@@ -352,18 +359,20 @@ namespace ShurikenToBabylonNpe
             Color c2 = main.startColor.colorMax;
             Color cDead = colorOverLifetime.enabled && colorOverLifetime.color.mode == ParticleSystemGradientMode.Color ? colorOverLifetime.color.color : new Color(0, 0, 0, 0);
 
-            // SystemBlock
+            // SystemBlock: name = particle system name; billBoardMode from renderer (Unity RenderMode = Billboard/Stretch/Horizontal/Vertical/Mesh/None)
+            int renderMode = (int)(renderer != null ? renderer.renderMode : ParticleSystemRenderMode.Billboard);
+            bool isBillboard = renderer == null || (renderMode != (int)ParticleSystemRenderMode.Mesh && renderMode != (int)ParticleSystemRenderMode.None);
             var systemBlock = new SystemBlockJson
             {
                 customType = "BABYLON.SystemBlock",
                 id = idSystem,
-                name = main.simulationSpace == ParticleSystemSimulationSpace.World ? "Particle system" : "Particle system (local)",
+                name = ps.name,
                 capacity = main.maxParticles,
                 manualEmitCount = GetManualEmitCountFromUnity(emission),
                 blendMode = GetBlendModeFromUnity(mat),
                 updateSpeed = 0.0167f,
-                isBillboardBased = true,
-                billBoardMode = 0,
+                isBillboardBased = isBillboard,
+                billBoardMode = isBillboard ? Math.Min(renderMode, 3) : 0,
                 isLocal = main.simulationSpace == ParticleSystemSimulationSpace.Local,
                 startDelay = main.startDelay.constant * 1000f,
                 emitRate = GetEmitRateFromUnity(emission),
