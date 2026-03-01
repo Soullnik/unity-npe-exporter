@@ -1,5 +1,5 @@
 {
-  "name": "com.babylonjs.unity-npe-exporter",
+  "name": "unity-npe-exporter",
   "version": "1.0.0",
   "displayName": "Unity NPE Exporter",
   "description": "Export Unity Shuriken (Particle System) to Babylon.js Node Particle Editor JSON (NodeParticleSystemSet).",
