@@ -151,6 +151,13 @@ namespace ShurikenToBabylonNpeEditor
                 string safeName = string.IsNullOrEmpty(g.root.name) ? "ParticleSystem" : SanitizeFileName(g.root.name);
                 string path = Path.Combine(folder, safeName + ".json");
                 File.WriteAllText(path, json);
+
+                string dumpText = UnityParticleSystemDumper.Dump(g.systems, g.root.name);
+                if (!string.IsNullOrEmpty(dumpText))
+                {
+                    string dumpPath = Path.Combine(folder, safeName + ".unity-properties.txt");
+                    File.WriteAllText(dumpPath, dumpText);
+                }
                 ok++;
             }
 

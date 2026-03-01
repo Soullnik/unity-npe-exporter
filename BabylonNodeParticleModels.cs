@@ -97,7 +97,19 @@ namespace BabylonNodeParticle
     public class BoxShapeBlockJson : BlockJson { }
 
     [Serializable]
-    public class SphereShapeBlockJson : BlockJson { }
+    public class SphereShapeBlockJson : BlockJson
+    {
+        public bool isHemispheric;
+    }
+
+    [Serializable]
+    public class ConeShapeBlockJson : BlockJson
+    {
+        public bool emitFromSpawnPointOnly;
+    }
+
+    [Serializable]
+    public class CylinderShapeBlockJson : BlockJson { }
 
     [Serializable]
     public class ParticleInputBlockJson : BlockJson
@@ -137,6 +149,16 @@ namespace BabylonNodeParticle
 
     [Serializable]
     public class UpdateSizeBlockJson : BlockJson { }
+
+    [Serializable]
+    public class UpdateAngleBlockJson : BlockJson { }
+
+    [Serializable]
+    public class ParticleClampBlockJson : BlockJson
+    {
+        public float minimum;
+        public float maximum = 1f;
+    }
 
     [Serializable]
     public class ParticleTextureSourceBlockJson : BlockJson

@@ -16,6 +16,7 @@ namespace ShurikenToBabylonNpe
         private const int ContextScaledDirection = 6;
         private const int ContextAgeGradient = 8;  // 0..1 over lifetime, for Lerp in Color/Size over lifetime
         private const int ContextAge = 3;
+        private const int ContextDirectionScale = 32;  // speed/magnitude for "by Speed" modules
         private const int TypeFloat = 0x0002;
         private const int TypeVector2 = 0x0004;
         private const int TypeVector3 = 0x0008;
@@ -26,6 +27,13 @@ namespace ShurikenToBabylonNpe
         private const int LockPerParticle = 1;
         private const int LockOncePerParticle = 3;
         private const int MathAdd = 0;
+        private const int MathSubtract = 1;
+        private const int MathDivide = 3;
+
+        // Babylon Engine blend modes (SystemBlock.blendMode): 0=ALPHA_COMBINE, 1=ALPHA_ADD, 2=ALPHA_MULTIPLY
+        private const int BlendCombine = 0;
+        private const int BlendAdditive = 1;
+        private const int BlendMultiply = 2;
 
         // Layout by connection flow: left = sources, right = consumers. Each "frame" = inputs | block.
         private const float LayoutStepX = 260f;
@@ -77,10 +85,80 @@ namespace ShurikenToBabylonNpe
 
         static int NextId(ref int nextId) { return nextId++; }
 
-        /// <summary>Get particles-per-second rate from Unity Emission.rateOverTime (MinMaxCurve). NPE emitRate = same semantic.</summary>
-        static float GetEmitRateFromUnity(ParticleSystem.MinMaxCurve rateOverTime)
+        /// <summary>Get effective particles-per-second from Unity Emission: rateOverTime, rateOverDistance (heuristic), and Bursts. Burst contributes only when it repeats: cycleCount==0 (infinite) or cycleCount>1; cycleCount==1 is one-shot at time (no steady rate).</summary>
+        static float GetEmitRateFromUnity(ParticleSystem.EmissionModule emission)
         {
-            return Mathf.Max(0f, rateOverTime.Evaluate(0.5f, 0.5f));
+            if (!emission.enabled) return 0f;
+            float rate = Mathf.Max(0f, emission.rateOverTime.Evaluate(0.5f, 0.5f));
+            // Rate over distance: particles per unit distance when emitter moves. Approximate as rate assuming 1 unit/s.
+            rate += Mathf.Max(0f, emission.rateOverDistance.Evaluate(0.5f, 0.5f));
+            // Burst: time=when, count=particles per burst, cycleCount=how many times (0=infinite), repeatInterval=seconds between repeats, probability=0..1 chance to trigger.
+            // Only add to rate when burst actually repeats (cycleCount 0 or >1). cycleCount==1 => one-shot at time, no continuous rate.
+            for (int i = 0; i < emission.burstCount; i++)
+            {
+                var burst = emission.GetBurst(i);
+                bool repeats = burst.cycleCount == 0 || burst.cycleCount > 1;
+                if (repeats && burst.repeatInterval > 0f)
+                {
+                    float count = Mathf.Max(0f, burst.count.Evaluate(0.5f, 0.5f));
+                    float prob = Mathf.Clamp01(burst.probability);
+                    rate += (count / burst.repeatInterval) * prob;
+                }
+            }
+            return Mathf.Max(0f, rate);
+        }
+
+        /// <summary>Get manualEmitCount for SystemBlock from one-shot bursts (cycleCount==1). Babylon emits this many particles once on start; use for Unity bursts at time&lt;=0.</summary>
+        static int GetManualEmitCountFromUnity(ParticleSystem.EmissionModule emission)
+        {
+            if (!emission.enabled) return -1;
+            int total = 0;
+            for (int i = 0; i < emission.burstCount; i++)
+            {
+                var burst = emission.GetBurst(i);
+                if (burst.cycleCount != 1) continue; // only one-shot
+                if (burst.time > 0.001f) continue;   // only at start; bursts at time>0 would need startDelay, not supported here
+                float count = Mathf.Max(0f, burst.count.Evaluate(0.5f, 0.5f));
+                float prob = Mathf.Clamp01(burst.probability);
+                total += Mathf.RoundToInt(count * prob);
+            }
+            return total > 0 ? total : -1;
+        }
+
+        /// <summary>Get NPE blend mode from Unity material. Uses Blending Mode / Rendering Mode properties (_BlendMode, _Blend, _Mode, or _SrcBlend/_DstBlend). Not material name. Color Mode is particle*material blend, not scene blend.</summary>
+        static int GetBlendModeFromUnity(Material mat)
+        {
+            if (mat == null) return BlendCombine;
+            // 1) URP Particles Unlit / Lit: Blending Mode = _BlendMode (0=Alpha, 1=Premultiply, 2=Additive, 3=Multiply)
+            if (mat.HasProperty("_BlendMode"))
+            {
+                int b = (int)mat.GetFloat("_BlendMode");
+                if (b == 2) return BlendAdditive;
+                if (b == 3) return BlendMultiply;
+                return BlendCombine; // 0 Alpha, 1 Premultiply
+            }
+            // 2) Alternative property name for blend mode (some URP shaders)
+            if (mat.HasProperty("_Blend"))
+            {
+                int b = (int)mat.GetFloat("_Blend");
+                if (b == 2) return BlendAdditive;
+                if (b == 3) return BlendMultiply;
+                return BlendCombine;
+            }
+            // 3) Legacy: _SrcBlend / _DstBlend (Unity BlendMode enum). Additive = (SrcAlpha, One), Alpha = (SrcAlpha, OneMinusSrcAlpha), Multiply = (Zero, DstColor).
+            if (mat.HasProperty("_DstBlend"))
+            {
+                int dst = (int)mat.GetFloat("_DstBlend");
+                if (dst == 1) return BlendAdditive;  // One
+                if (dst == 9) return BlendCombine;  // OneMinusSrcAlpha
+            }
+            if (mat.HasProperty("_SrcBlend") && mat.HasProperty("_DstBlend"))
+            {
+                int src = (int)mat.GetFloat("_SrcBlend");
+                int dst = (int)mat.GetFloat("_DstBlend");
+                if (src == 0 && (dst == 2 || dst == 4)) return BlendMultiply;
+            }
+            return BlendCombine;
         }
 
         /// <summary>Get start/end color from Unity Color over Lifetime gradient (time 0 and 1).</summary>
@@ -123,8 +201,23 @@ namespace ShurikenToBabylonNpe
             }
             else if (!t2d.isReadable)
             {
-                UnityEngine.Debug.Log($"[ShurikenToNpe] Texture2D '{t2d.name}' is not readable (enable Read/Write in Import Settings).");
-                return null;
+                UnityEngine.Debug.Log($"[ShurikenToNpe] Texture2D '{t2d.name}' is not readable; copying via RenderTexture.");
+            }
+            // Use Blit path for compressed or non-readable Texture2D (EncodeToPNG does not support compressed formats).
+            bool useBlitPath = t2d != null && !tempCreated && (!t2d.isReadable || (t2d.format != TextureFormat.RGBA32 && t2d.format != TextureFormat.ARGB32));
+            if (useBlitPath && t2d != null)
+            {
+                int w = t2d.width, h = t2d.height;
+                RenderTexture rt = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Default);
+                RenderTexture prev = RenderTexture.active;
+                RenderTexture.active = rt;
+                Graphics.Blit(tex, rt);
+                t2d = new Texture2D(w, h, TextureFormat.RGBA32, false);
+                t2d.ReadPixels(new Rect(0, 0, w, h), 0, 0);
+                t2d.Apply();
+                RenderTexture.active = prev;
+                RenderTexture.ReleaseTemporary(rt);
+                tempCreated = true;
             }
             try
             {
@@ -136,7 +229,7 @@ namespace ShurikenToBabylonNpe
                     UnityEngine.Debug.Log("[ShurikenToNpe] EncodeToPNG returned null or empty.");
                     return null;
                 }
-                UnityEngine.Debug.Log($"[ShurikenToNpe] Texture encoded to PNG, {png.Length} bytes, base64 length {System.Convert.ToBase64String(png).Length}");
+                UnityEngine.Debug.Log($"[ShurikenToNpe] Texture encoded to PNG, {png.Length} bytes");
                 return "data:image/png;base64," + System.Convert.ToBase64String(png);
             }
             catch (System.Exception e)
@@ -174,6 +267,10 @@ namespace ShurikenToBabylonNpe
             var shape = ps.shape;
             var colorOverLifetime = ps.colorOverLifetime;
             var sizeOverLifetime = ps.sizeOverLifetime;
+            var rotationOverLifetime = ps.rotationOverLifetime;
+            var colorBySpeed = ps.colorBySpeed;
+            var sizeBySpeed = ps.sizeBySpeed;
+            var rotationBySpeed = ps.rotationBySpeed;
             var renderer = ps.GetComponent<ParticleSystemRenderer>();
             UnityEngine.Debug.Log($"[ShurikenToNpe] ParticleSystem '{ps.name}': renderer={(renderer != null ? renderer.name : "null")}");
             UnityEngine.Material mat = renderer != null ? renderer.sharedMaterial : null;
@@ -254,6 +351,24 @@ namespace ShurikenToBabylonNpe
                 idSizeOverLifetimeEnd = NextId(ref nextId);
                 idLerpSizeOverLifetime = NextId(ref nextId);
             }
+            int idUpdateAngle = 0, idAgeRot = 0, idAngleRotStart = 0, idAngleRotEnd = 0, idLerpAngleRot = 0;
+            if (rotationOverLifetime.enabled)
+            {
+                idUpdateAngle = NextId(ref nextId);
+                idAgeRot = NextId(ref nextId);
+                idAngleRotStart = NextId(ref nextId);
+                idAngleRotEnd = NextId(ref nextId);
+                idLerpAngleRot = NextId(ref nextId);
+            }
+            bool needSpeedNorm = (colorBySpeed.enabled && !colorOverLifetime.enabled) || (sizeBySpeed.enabled && !sizeOverLifetime.enabled) || (rotationBySpeed.enabled && !rotationOverLifetime.enabled);
+            int idDirScale = 0, idSpeedMinConst = 0, idSubSpeedMin = 0, idRangeSize = 0, idDivNorm = 0, idClampNorm = 0;
+            if (needSpeedNorm) { idDirScale = NextId(ref nextId); idSpeedMinConst = NextId(ref nextId); idSubSpeedMin = NextId(ref nextId); idRangeSize = NextId(ref nextId); idDivNorm = NextId(ref nextId); idClampNorm = NextId(ref nextId); }
+            int idColorBySpeedStart = 0, idColorBySpeedEnd = 0, idLerpColorBySpeed = 0, idUpdateColorBySpeed = 0;
+            if (colorBySpeed.enabled && !colorOverLifetime.enabled) { idColorBySpeedStart = NextId(ref nextId); idColorBySpeedEnd = NextId(ref nextId); idLerpColorBySpeed = NextId(ref nextId); idUpdateColorBySpeed = NextId(ref nextId); }
+            int idSizeBySpeedStart = 0, idSizeBySpeedEnd = 0, idLerpSizeBySpeed = 0, idUpdateSizeBySpeed = 0;
+            if (sizeBySpeed.enabled && !sizeOverLifetime.enabled) { idSizeBySpeedStart = NextId(ref nextId); idSizeBySpeedEnd = NextId(ref nextId); idLerpSizeBySpeed = NextId(ref nextId); idUpdateSizeBySpeed = NextId(ref nextId); }
+            int idAngleBySpeedStart = 0, idAngleBySpeedEnd = 0, idLerpAngleBySpeed = 0, idUpdateAngleBySpeed = 0;
+            if (rotationBySpeed.enabled && !rotationOverLifetime.enabled) { idAngleBySpeedStart = NextId(ref nextId); idAngleBySpeedEnd = NextId(ref nextId); idLerpAngleBySpeed = NextId(ref nextId); idUpdateAngleBySpeed = NextId(ref nextId); }
 
             float fy(int frame) => frame * FrameHeight;
 
@@ -272,21 +387,25 @@ namespace ShurikenToBabylonNpe
                 id = idSystem,
                 name = main.simulationSpace == ParticleSystemSimulationSpace.World ? "Particle system" : "Particle system (local)",
                 capacity = main.maxParticles,
-                manualEmitCount = -1,
-                blendMode = 0,
+                manualEmitCount = GetManualEmitCountFromUnity(emission),
+                blendMode = GetBlendModeFromUnity(mat),
                 updateSpeed = 0.0167f,
                 isBillboardBased = true,
                 billBoardMode = 0,
                 isLocal = main.simulationSpace == ParticleSystemSimulationSpace.Local,
-                startDelay = main.startDelay.constant,
-                emitRate = GetEmitRateFromUnity(emission.rateOverTime),
+                startDelay = main.startDelay.constant * 1000f,
+                emitRate = GetEmitRateFromUnity(emission),
                 targetStopDuration = main.duration * (main.loop ? 0 : 1),
                 emitter = new float[] { 0, 0, 0 }
             };
-            // Particle chain: UpdatePosition -> [UpdateColor] -> [UpdateSize] -> System
+            // Particle chain: UpdatePosition -> [UpdateColor] -> [UpdateSize] -> [UpdateAngle] -> System (each step optional)
             int idParticleSourceForSystem = idUpdatePosition;
             if (colorOverLifetime.enabled) idParticleSourceForSystem = idUpdateColor;
+            else if (colorBySpeed.enabled) idParticleSourceForSystem = idUpdateColorBySpeed;
             if (sizeOverLifetime.enabled) idParticleSourceForSystem = idUpdateSize;
+            else if (sizeBySpeed.enabled) idParticleSourceForSystem = idUpdateSizeBySpeed;
+            if (rotationOverLifetime.enabled) idParticleSourceForSystem = idUpdateAngle;
+            else if (rotationBySpeed.enabled) idParticleSourceForSystem = idUpdateAngleBySpeed;
             systemBlock.inputs.Add(Connection("particle", idParticleSourceForSystem, "output"));
             systemBlock.inputs.Add(ValueInput("emitRate", systemBlock.emitRate));
             systemBlock.inputs.Add(Connection("texture", idTexture, "texture"));
@@ -395,6 +514,131 @@ namespace ShurikenToBabylonNpe
                 AddLoc(set, idUpdateSize, baseX + LayoutColUpdatePosition * LayoutStepX, baseY + (colorOverLifetime.enabled ? 1080f : 900f));
             }
 
+            // Rotation over Lifetime: UpdateAngleBlock (particle from chain, angle from Lerp(angle0, angle1, age gradient)). Unity uses angular velocity (deg/s); we approximate as angle at 0 and 1.
+            if (rotationOverLifetime.enabled)
+            {
+                var rotCurve = rotationOverLifetime.z;
+                float angle0 = rotCurve.Evaluate(0f, 0f) * Mathf.Deg2Rad;
+                float angle1 = rotCurve.Evaluate(1f, 0f) * Mathf.Deg2Rad;
+                int ageRotId = (colorOverLifetime.enabled || sizeOverLifetime.enabled) ? (colorOverLifetime.enabled ? idAge : idAgeForSize) : idAgeRot;
+                if (ageRotId == idAgeRot)
+                {
+                    var ageRotInput = new ParticleInputBlockJson { customType = "BABYLON.ParticleInputBlock", id = idAgeRot, name = "Age gradient (rotation)", type = TypeFloat, contextualValue = ContextAgeGradient, systemSource = 0, min = 0, max = 0, groupInInspector = "", displayInInspector = true };
+                    ageRotInput.outputs.Add(Out("output"));
+                    set.blocks.Add(ageRotInput);
+                    AddLoc(set, idAgeRot, baseX + LayoutColInputs * LayoutStepX, baseY + fy(8));
+                }
+                AddInputBlock(set, idAngleRotStart, "Rotation over lifetime (start)", angle0, baseX, baseY, LayoutColInputs, baseY + fy(8) + LayoutStepY);
+                AddInputBlock(set, idAngleRotEnd, "Rotation over lifetime (end)", angle1, baseX, baseY, LayoutColInputs, baseY + fy(8) + 2 * LayoutStepY);
+                AddLerpBlock(set, idLerpAngleRot, "Lerp angle over lifetime", idAngleRotStart, idAngleRotEnd, ageRotId);
+                AddLoc(set, idLerpAngleRot, baseX + LayoutColRandomLerp * LayoutStepX, baseY + fy(8) + LayoutStepY);
+                int chainHeadForAngle = sizeOverLifetime.enabled ? idUpdateSize : (colorOverLifetime.enabled ? idUpdateColor : idUpdatePosition);
+                var updateAngle = new UpdateAngleBlockJson { customType = "BABYLON.UpdateAngleBlock", id = idUpdateAngle, name = "Update angle" };
+                updateAngle.inputs.Add(Connection("particle", chainHeadForAngle, "output"));
+                updateAngle.inputs.Add(Connection("angle", idLerpAngleRot, "output"));
+                updateAngle.outputs.Add(Out("output"));
+                set.blocks.Add(updateAngle);
+                AddLoc(set, idUpdateAngle, baseX + LayoutColUpdatePosition * LayoutStepX, baseY + (sizeOverLifetime.enabled ? 1260f : (colorOverLifetime.enabled ? 1080f : 900f)));
+            }
+
+            // By Speed: shared speed normalization (Direction scale -> Subtract(min) -> Divide(range) -> Clamp(0,1)), then per-module Lerp + Update.
+            if (needSpeedNorm)
+            {
+                Vector2 speedRange = (colorBySpeed.enabled && !colorOverLifetime.enabled) ? colorBySpeed.range : ((sizeBySpeed.enabled && !sizeOverLifetime.enabled) ? sizeBySpeed.range : rotationBySpeed.range);
+                float speedMin = speedRange.x;
+                float rangeSize = Mathf.Max(0.0001f, speedRange.y - speedRange.x);
+
+                var dirScaleInput = new ParticleInputBlockJson
+                {
+                    customType = "BABYLON.ParticleInputBlock",
+                    id = idDirScale,
+                    name = "Direction scale",
+                    type = TypeFloat,
+                    contextualValue = ContextDirectionScale,
+                    systemSource = 0,
+                    min = 0,
+                    max = 0,
+                    groupInInspector = "",
+                    displayInInspector = true
+                };
+                dirScaleInput.outputs.Add(Out("output"));
+                set.blocks.Add(dirScaleInput);
+                AddLoc(set, idDirScale, baseX + LayoutColPositionDir * LayoutStepX, baseY + 1700f);
+
+                AddInputBlock(set, idSpeedMinConst, "Speed range min", speedMin, baseX, baseY, LayoutColInputs, 1700f);
+                AddInputBlock(set, idRangeSize, "Speed range size", rangeSize, baseX, baseY, LayoutColInputs, 1780f);
+
+                var subBlock = new ParticleMathBlockJson { customType = "BABYLON.ParticleMathBlock", id = idSubSpeedMin, name = "Speed minus min", operation = MathSubtract };
+                subBlock.inputs.Add(Connection("left", idDirScale, "output"));
+                subBlock.inputs.Add(Connection("right", idSpeedMinConst, "output"));
+                subBlock.outputs.Add(Out("output"));
+                set.blocks.Add(subBlock);
+                AddLoc(set, idSubSpeedMin, baseX + LayoutColRandomLerp * LayoutStepX, baseY + 1700f);
+
+                var divBlock = new ParticleMathBlockJson { customType = "BABYLON.ParticleMathBlock", id = idDivNorm, name = "Normalized speed", operation = MathDivide };
+                divBlock.inputs.Add(Connection("left", idSubSpeedMin, "output"));
+                divBlock.inputs.Add(Connection("right", idRangeSize, "output"));
+                divBlock.outputs.Add(Out("output"));
+                set.blocks.Add(divBlock);
+                AddLoc(set, idDivNorm, baseX + LayoutColRandomLerp * LayoutStepX, baseY + 1780f);
+
+                var clampBlock = new ParticleClampBlockJson { customType = "BABYLON.ParticleClampBlock", id = idClampNorm, name = "Clamp speed 0-1", minimum = 0f, maximum = 1f };
+                clampBlock.inputs.Add(Connection("value", idDivNorm, "output"));
+                clampBlock.outputs.Add(Out("output"));
+                set.blocks.Add(clampBlock);
+                AddLoc(set, idClampNorm, baseX + LayoutColRandomLerp * LayoutStepX, baseY + 1860f);
+            }
+
+            if (colorBySpeed.enabled && !colorOverLifetime.enabled)
+            {
+                Color colStart = colorBySpeed.color.Evaluate(0f, 0f);
+                Color colEnd = colorBySpeed.color.Evaluate(1f, 0f);
+                AddInputBlockColor4(set, idColorBySpeedStart, "Color by speed (start)", colStart.r, colStart.g, colStart.b, colStart.a, baseX, baseY, LayoutColInputs, baseY + 1900f);
+                AddInputBlockColor4(set, idColorBySpeedEnd, "Color by speed (end)", colEnd.r, colEnd.g, colEnd.b, colEnd.a, baseX, baseY, LayoutColInputs, baseY + 1980f);
+                AddLerpBlock(set, idLerpColorBySpeed, "Lerp color by speed", idColorBySpeedStart, idColorBySpeedEnd, idClampNorm);
+                AddLoc(set, idLerpColorBySpeed, baseX + LayoutColRandomLerp * LayoutStepX, baseY + 1940f);
+                var updateColorBySpeed = new UpdateColorBlockJson { customType = "BABYLON.UpdateColorBlock", id = idUpdateColorBySpeed, name = "Update color by speed" };
+                updateColorBySpeed.inputs.Add(Connection("particle", idUpdatePosition, "output"));
+                updateColorBySpeed.inputs.Add(Connection("color", idLerpColorBySpeed, "output"));
+                updateColorBySpeed.outputs.Add(Out("output"));
+                set.blocks.Add(updateColorBySpeed);
+                AddLoc(set, idUpdateColorBySpeed, baseX + LayoutColUpdatePosition * LayoutStepX, baseY + 1940f);
+            }
+
+            if (sizeBySpeed.enabled && !sizeOverLifetime.enabled)
+            {
+                float sizeStart = sizeBySpeed.size.Evaluate(0f, 0f);
+                float sizeEnd = sizeBySpeed.size.Evaluate(1f, 0f);
+                AddInputBlock(set, idSizeBySpeedStart, "Size by speed (start)", sizeStart, baseX, baseY, LayoutColInputs, baseY + 2020f);
+                AddInputBlock(set, idSizeBySpeedEnd, "Size by speed (end)", sizeEnd, baseX, baseY, LayoutColInputs, baseY + 2100f);
+                AddLerpBlock(set, idLerpSizeBySpeed, "Lerp size by speed", idSizeBySpeedStart, idSizeBySpeedEnd, idClampNorm);
+                AddLoc(set, idLerpSizeBySpeed, baseX + LayoutColRandomLerp * LayoutStepX, baseY + 2060f);
+                int chainHeadForSizeBySpeed = colorOverLifetime.enabled ? idUpdateColor : (colorBySpeed.enabled ? idUpdateColorBySpeed : idUpdatePosition);
+                var updateSizeBySpeed = new UpdateSizeBlockJson { customType = "BABYLON.UpdateSizeBlock", id = idUpdateSizeBySpeed, name = "Update size by speed" };
+                updateSizeBySpeed.inputs.Add(Connection("particle", chainHeadForSizeBySpeed, "output"));
+                updateSizeBySpeed.inputs.Add(Connection("size", idLerpSizeBySpeed, "output"));
+                updateSizeBySpeed.outputs.Add(Out("output"));
+                set.blocks.Add(updateSizeBySpeed);
+                AddLoc(set, idUpdateSizeBySpeed, baseX + LayoutColUpdatePosition * LayoutStepX, baseY + 2060f);
+            }
+
+            if (rotationBySpeed.enabled && !rotationOverLifetime.enabled)
+            {
+                float angleStart = rotationBySpeed.z.Evaluate(0f, 0f) * Mathf.Deg2Rad;
+                float angleEnd = rotationBySpeed.z.Evaluate(1f, 0f) * Mathf.Deg2Rad;
+                AddInputBlock(set, idAngleBySpeedStart, "Angle by speed (start)", angleStart, baseX, baseY, LayoutColInputs, baseY + 2140f);
+                AddInputBlock(set, idAngleBySpeedEnd, "Angle by speed (end)", angleEnd, baseX, baseY, LayoutColInputs, baseY + 2220f);
+                AddLerpBlock(set, idLerpAngleBySpeed, "Lerp angle by speed", idAngleBySpeedStart, idAngleBySpeedEnd, idClampNorm);
+                AddLoc(set, idLerpAngleBySpeed, baseX + LayoutColRandomLerp * LayoutStepX, baseY + 2180f);
+                int chainHeadForAngleBySpeed = sizeOverLifetime.enabled ? idUpdateSize : (sizeBySpeed.enabled ? idUpdateSizeBySpeed : (colorOverLifetime.enabled ? idUpdateColor : (colorBySpeed.enabled ? idUpdateColorBySpeed : idUpdatePosition)));
+                var updateAngleBySpeed = new UpdateAngleBlockJson { customType = "BABYLON.UpdateAngleBlock", id = idUpdateAngleBySpeed, name = "Update angle by speed" };
+                updateAngleBySpeed.inputs.Add(Connection("particle", chainHeadForAngleBySpeed, "output"));
+                updateAngleBySpeed.inputs.Add(Connection("angle", idLerpAngleBySpeed, "output"));
+                updateAngleBySpeed.outputs.Add(Out("output"));
+                set.blocks.Add(updateAngleBySpeed);
+                AddLoc(set, idUpdateAngleBySpeed, baseX + LayoutColUpdatePosition * LayoutStepX, baseY + 2180f);
+            }
+
             // Add (Position + ScaledDirection)
             var addBlock = new ParticleMathBlockJson
             {
@@ -473,40 +717,8 @@ namespace ShurikenToBabylonNpe
             AddLoc(set, idCreateParticle, baseX + LayoutColCreateParticle * LayoutStepX, baseY + 720f);
             set.blocks.Add(createBlock);
 
-            // Shape (Box or Point)
-            if (shape.shapeType == ParticleSystemShapeType.Box)
-            {
-                var box = new BoxShapeBlockJson
-                {
-                    customType = "BABYLON.BoxShapeBlock",
-                    id = idShape,
-                    name = "Box shape"
-                };
-                box.inputs.Add(Connection("particle", idCreateParticle, "particle"));
-                Vector3 size = shape.scale;
-                box.inputs.Add(ValueVector3("direction1", 0, 1, 0));
-                box.inputs.Add(ValueVector3("direction2", 0, 1, 0));
-                box.inputs.Add(ValueVector3("minEmitBox", -size.x * 0.5f, -size.y * 0.5f, -size.z * 0.5f));
-                box.inputs.Add(ValueVector3("maxEmitBox", size.x * 0.5f, size.y * 0.5f, size.z * 0.5f));
-                box.outputs.Add(Out("output"));
-                AddLoc(set, idShape, baseX + LayoutColShape * LayoutStepX, baseY + 720f);
-                set.blocks.Add(box);
-            }
-            else
-            {
-                var point = new PointShapeBlockJson
-                {
-                    customType = "BABYLON.PointShapeBlock",
-                    id = idShape,
-                    name = "Point shape"
-                };
-                point.inputs.Add(Connection("particle", idCreateParticle, "particle"));
-                point.inputs.Add(ValueVector3("direction1", 0, 1, 0));
-                point.inputs.Add(ValueVector3("direction2", 0, 1, 0));
-                point.outputs.Add(Out("output"));
-                AddLoc(set, idShape, baseX + LayoutColShape * LayoutStepX, baseY + 720f);
-                set.blocks.Add(point);
-            }
+            // Shape: Box, Sphere, Hemisphere, Cone, ConeVolume, Circle→Cylinder, else Point
+            AddShapeBlock(set, shape, idShape, idCreateParticle, baseX, baseY);
 
             // Frame 0: Lifetime — Constant: one block; TwoConstants/Curve: Min, Max, Random
             AddInputBlock(set, idLifetimeMin, lifetimeConst ? "Lifetime" : "Min Lifetime", minLife, baseX, baseY, LayoutColInputs, fy(0));
@@ -585,6 +797,96 @@ namespace ShurikenToBabylonNpe
         static void AddLoc(NodeParticleSystemSetJson set, int blockId, float x, float y)
         {
             set.editorData.locations.Add(new LocationJson { blockId = blockId, x = x, y = y, isCollapsed = false });
+        }
+
+        /// <summary>Get single float from Unity ShapeModule MinMaxCurve (e.g. radius).</summary>
+        static float GetShapeCurveValue(ParticleSystem.MinMaxCurve curve)
+        {
+            GetMinMaxFromCurve(curve, out float min, out float max);
+            return (min + max) * 0.5f;
+        }
+
+        /// <summary>Add the correct shape block for Unity shape.type: Box, Sphere, Hemisphere, Cone, ConeVolume, Circle→Cylinder, else Point.</summary>
+        static void AddShapeBlock(NodeParticleSystemSetJson set, ParticleSystem.ShapeModule shape, int idShape, int idCreateParticle, float baseX, float baseY)
+        {
+            float shapeX = baseX + LayoutColShape * LayoutStepX;
+            float shapeY = baseY + 720f;
+            void FinishShape(BlockJson block)
+            {
+                block.inputs.Insert(0, Connection("particle", idCreateParticle, "particle"));
+                block.outputs.Add(Out("output"));
+                set.blocks.Add(block);
+                AddLoc(set, idShape, shapeX, shapeY);
+            }
+
+            switch (shape.shapeType)
+            {
+                case ParticleSystemShapeType.Box:
+                    var box = new BoxShapeBlockJson { customType = "BABYLON.BoxShapeBlock", id = idShape, name = "Box shape" };
+                    Vector3 size = shape.scale;
+                    box.inputs.Add(ValueVector3("direction1", 0, 1, 0));
+                    box.inputs.Add(ValueVector3("direction2", 0, 1, 0));
+                    box.inputs.Add(ValueVector3("minEmitBox", -size.x * 0.5f, -size.y * 0.5f, -size.z * 0.5f));
+                    box.inputs.Add(ValueVector3("maxEmitBox", size.x * 0.5f, size.y * 0.5f, size.z * 0.5f));
+                    FinishShape(box);
+                    break;
+                case ParticleSystemShapeType.Sphere:
+                    var sphere = new SphereShapeBlockJson { customType = "BABYLON.SphereShapeBlock", id = idShape, name = "Sphere shape", isHemispheric = false };
+                    float radiusS = GetShapeCurveValue(shape.radius);
+                    float radiusRangeS = 1f - Mathf.Clamp01(shape.radiusThickness);
+                    sphere.inputs.Add(ValueInput("radius", radiusS));
+                    sphere.inputs.Add(ValueInput("radiusRange", radiusRangeS));
+                    sphere.inputs.Add(ValueInput("directionRandomizer", 0f));
+                    sphere.inputs.Add(ValueVector3("direction1", 0, 1, 0));
+                    sphere.inputs.Add(ValueVector3("direction2", 0, 1, 0));
+                    FinishShape(sphere);
+                    break;
+                case ParticleSystemShapeType.Hemisphere:
+                    var hemi = new SphereShapeBlockJson { customType = "BABYLON.SphereShapeBlock", id = idShape, name = "Hemisphere shape", isHemispheric = true };
+                    float radiusH = GetShapeCurveValue(shape.radius);
+                    float radiusRangeH = 1f - Mathf.Clamp01(shape.radiusThickness);
+                    hemi.inputs.Add(ValueInput("radius", radiusH));
+                    hemi.inputs.Add(ValueInput("radiusRange", radiusRangeH));
+                    hemi.inputs.Add(ValueInput("directionRandomizer", 0f));
+                    hemi.inputs.Add(ValueVector3("direction1", 0, 1, 0));
+                    hemi.inputs.Add(ValueVector3("direction2", 0, 1, 0));
+                    FinishShape(hemi);
+                    break;
+                case ParticleSystemShapeType.Cone:
+                case ParticleSystemShapeType.ConeVolume:
+                    var cone = new ConeShapeBlockJson { customType = "BABYLON.ConeShapeBlock", id = idShape, name = "Cone shape", emitFromSpawnPointOnly = false };
+                    float radiusC = GetShapeCurveValue(shape.radius);
+                    float angleC = shape.angle * Mathf.Deg2Rad;
+                    float lengthC = shape.length;
+                    cone.inputs.Add(ValueInput("radius", radiusC));
+                    cone.inputs.Add(ValueInput("angle", angleC));
+                    cone.inputs.Add(ValueInput("radiusRange", 1f - Mathf.Clamp01(shape.radiusThickness)));
+                    cone.inputs.Add(ValueInput("heightRange", lengthC > 0 ? lengthC : 1f));
+                    cone.inputs.Add(ValueInput("directionRandomizer", 0f));
+                    cone.inputs.Add(ValueVector3("direction1", 0, 1, 0));
+                    cone.inputs.Add(ValueVector3("direction2", 0, 1, 0));
+                    FinishShape(cone);
+                    break;
+                case ParticleSystemShapeType.Circle:
+                    var cyl = new CylinderShapeBlockJson { customType = "BABYLON.CylinderShapeBlock", id = idShape, name = "Cylinder shape" };
+                    float radiusCy = GetShapeCurveValue(shape.radius);
+                    float heightCy = shape.length > 0 ? shape.length : 0.01f;
+                    float radiusRangeCy = 1f - Mathf.Clamp01(shape.radiusThickness);
+                    cyl.inputs.Add(ValueInput("radius", radiusCy));
+                    cyl.inputs.Add(ValueInput("height", heightCy));
+                    cyl.inputs.Add(ValueInput("radiusRange", radiusRangeCy));
+                    cyl.inputs.Add(ValueInput("directionRandomizer", 0f));
+                    cyl.inputs.Add(ValueVector3("direction1", 0, 1, 0));
+                    cyl.inputs.Add(ValueVector3("direction2", 0, 1, 0));
+                    FinishShape(cyl);
+                    break;
+                default:
+                    var point = new PointShapeBlockJson { customType = "BABYLON.PointShapeBlock", id = idShape, name = "Point shape" };
+                    point.inputs.Add(ValueVector3("direction1", 0, 1, 0));
+                    point.inputs.Add(ValueVector3("direction2", 0, 1, 0));
+                    FinishShape(point);
+                    break;
+            }
         }
 
         static InputPortJson Connection(string inputName, int targetBlockId, string targetConnectionName)

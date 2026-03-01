@@ -137,6 +137,19 @@ namespace ShurikenToBabylonNpe
                 Prop(sb, "invertY", tex.invertY, ind);
                 if (tex.textureDataUrl != null) Prop(sb, "textureDataUrl", tex.textureDataUrl, ind);
             }
+            else if (b is SphereShapeBlockJson sphere)
+            {
+                Prop(sb, "isHemispheric", sphere.isHemispheric, ind);
+            }
+            else if (b is ConeShapeBlockJson cone)
+            {
+                Prop(sb, "emitFromSpawnPointOnly", cone.emitFromSpawnPointOnly, ind);
+            }
+            else if (b is ParticleClampBlockJson clamp)
+            {
+                Prop(sb, "minimum", clamp.minimum, ind);
+                Prop(sb, "maximum", clamp.maximum, ind);
+            }
 
             if (ind != null) ind--;
             sb.Append(ind != null ? "\n}" : "}");
