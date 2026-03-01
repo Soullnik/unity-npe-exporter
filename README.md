@@ -1,7 +1,6 @@
 # Unity NPE Exporter
 
-Exports **Unity Shuriken (Particle System)** to **Babylon.js Node Particle Editor** (NodeParticleSystemSet) JSON.  
-You can add this tool to your project using either method below.
+Exports **Unity Shuriken (Particle System)** to **Babylon.js Node Particle Editor** (NodeParticleSystemSet) JSON.
 
 ---
 
@@ -15,18 +14,16 @@ You can add this tool to your project using either method below.
    ```text
    https://github.com/Soullnik/unity-npe-exporter.git
    ```
-   (replace `USER` with the repo owner; you can add `#main` or `#v1.0.0` for branch/tag).
+   (you can add `#main` or `#v1.0.0` for branch/tag).
 4. Click **Add**. The package will appear under **Packages**, and **Tools → Babylon NPE → Export Shuriken to Node Particle Editor JSON** in the menu.
 
 To update: in Package Manager select the package → **Update** (or change the version/tag in the URL).
 
-### Option 2: Via .unitypackage (no Git)
+### Option 2: Copy sources into Assets
 
-1. Download the **`.unitypackage`** from [Releases](https://github.com/Soullnik/unity-npe-exporter.git).
-2. In Unity: **Assets → Import Package → Custom Package...** → select the downloaded file.
-3. Import all items. **Tools → Babylon NPE → ...** will then appear in the menu.
-
-**To build a .unitypackage for distribution:** open the project containing this tool in Unity, select the **Assets/Editor** folder in the Project window, choose **Assets → Export Package...**, include the desired files, and export.
+1. Clone or download this repo.
+2. Copy the **`Assets/Editor`** folder (with all `.cs` scripts and the Editor README) into your Unity project’s **`Assets`** folder, e.g. so you have `YourProject/Assets/Editor/...`.
+3. Unity will compile the scripts and add **Tools → Babylon NPE → Export Shuriken to Node Particle Editor JSON** to the menu.
 
 ---
 
