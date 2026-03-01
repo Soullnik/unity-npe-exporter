@@ -22,7 +22,7 @@ To update: in Package Manager select the package → **Update** (or change the v
 
 ### Option 2: Via .unitypackage (no Git)
 
-1. Download the **`.unitypackage`** from [Releases](https://github.com/USER/unity-exporter-tool/releases) (it needs to be built and published once).
+1. Download the **`.unitypackage`** from [Releases](https://github.com/Soullnik/unity-npe-exporter.git).
 2. In Unity: **Assets → Import Package → Custom Package...** → select the downloaded file.
 3. Import all items. **Tools → Babylon NPE → ...** will then appear in the menu.
 
