@@ -1,4 +1,4 @@
-# Babylon NPE Exporter
+# Unity NPE Exporter
 
 Exports **Unity Shuriken (Particle System)** to **Babylon.js Node Particle Editor** (NodeParticleSystemSet) JSON.  
 You can add this tool to your project using either method below.
@@ -13,7 +13,7 @@ You can add this tool to your project using either method below.
 2. Click **+** → **Add package from git URL...**
 3. Paste the repository URL, e.g.:
    ```text
-   https://github.com/USER/unity-exporter-tool.git
+   https://github.com/Soullnik/unity-npe-exporter.git
    ```
    (replace `USER` with the repo owner; you can add `#main` or `#v1.0.0` for branch/tag).
 4. Click **Add**. The package will appear under **Packages**, and **Tools → Babylon NPE → Export Shuriken to Node Particle Editor JSON** in the menu.
