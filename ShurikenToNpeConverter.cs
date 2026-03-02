@@ -125,26 +125,27 @@ namespace ShurikenToBabylonNpe
             return total > 0 ? total : -1;
         }
 
-        /// <summary>Get NPE blend mode from Unity material. Checks _ColorMode (particle Color Mode), then _BlendMode / _Blend (Rendering Mode), then _SrcBlend/_DstBlend.</summary>
+        /// <summary>Get NPE blend mode from Unity material. Prefer _SrcBlend/_DstBlend (actual blend state), then _BlendMode/_Blend, then _ColorMode.</summary>
         static int GetBlendModeFromUnity(Material mat)
         {
             if (mat == null) return BlendCombine;
-            // 0) Particle Color Mode (Multiply/Additive) — often drives the actual blend in particle shaders (Rendering Mode Fade + Color Mode Multiply => multiply blend)
-            if (mat.HasProperty("_ColorMode"))
+            // 0) _SrcBlend / _DstBlend — actual blend state (Unity enum: SrcAlpha=5, One=1, OneMinusSrcAlpha=10, Zero=0, DstColor=2/4). Takes precedence over _ColorMode.
+            if (mat.HasProperty("_SrcBlend") && mat.HasProperty("_DstBlend"))
             {
-                int c = (int)mat.GetFloat("_ColorMode");
-                if (c == 1) return BlendAdditive;   // Additive
-                if (c == 0) return BlendMultiply;   // Multiply (common value for Multiply in particle shaders)
+                int src = (int)mat.GetFloat("_SrcBlend");
+                int dst = (int)mat.GetFloat("_DstBlend");
+                if (dst == 1) return BlendAdditive;   // One => Additive (e.g. SrcAlpha, One)
+                if (dst == 9) return BlendCombine;   // OneMinusSrcAlpha => Alpha blend
+                if (src == 0 && (dst == 2 || dst == 4)) return BlendMultiply;
             }
-            // 1) URP Particles Unlit / Lit: Blending Mode = _BlendMode (0=Alpha, 1=Premultiply, 2=Additive, 3=Multiply)
+            // 1) URP Particles: _BlendMode (0=Alpha, 1=Premultiply, 2=Additive, 3=Multiply)
             if (mat.HasProperty("_BlendMode"))
             {
                 int b = (int)mat.GetFloat("_BlendMode");
                 if (b == 2) return BlendAdditive;
                 if (b == 3) return BlendMultiply;
-                return BlendCombine; // 0 Alpha, 1 Premultiply
+                return BlendCombine;
             }
-            // 2) Alternative property name for blend mode (some URP shaders)
             if (mat.HasProperty("_Blend"))
             {
                 int b = (int)mat.GetFloat("_Blend");
@@ -152,18 +153,12 @@ namespace ShurikenToBabylonNpe
                 if (b == 3) return BlendMultiply;
                 return BlendCombine;
             }
-            // 3) Legacy: _SrcBlend / _DstBlend (Unity BlendMode enum). Additive = (SrcAlpha, One), Alpha = (SrcAlpha, OneMinusSrcAlpha), Multiply = (Zero, DstColor).
-            if (mat.HasProperty("_DstBlend"))
+            // 2) Particle _ColorMode (shader-dependent: 0 can be Additive or Multiply depending on shader)
+            if (mat.HasProperty("_ColorMode"))
             {
-                int dst = (int)mat.GetFloat("_DstBlend");
-                if (dst == 1) return BlendAdditive;  // One
-                if (dst == 9) return BlendCombine;  // OneMinusSrcAlpha
-            }
-            if (mat.HasProperty("_SrcBlend") && mat.HasProperty("_DstBlend"))
-            {
-                int src = (int)mat.GetFloat("_SrcBlend");
-                int dst = (int)mat.GetFloat("_DstBlend");
-                if (src == 0 && (dst == 2 || dst == 4)) return BlendMultiply;
+                int c = (int)mat.GetFloat("_ColorMode");
+                if (c == 1) return BlendAdditive;
+                if (c == 0) return BlendMultiply;
             }
             return BlendCombine;
         }
@@ -355,13 +350,45 @@ namespace ShurikenToBabylonNpe
             GetMinMaxFromCurve(main.startSpeed, out float minSpeed, out float maxSpeed);
             GetMinMaxFromCurve(main.startSize, out float minSize, out float maxSize);
             GetMinMaxFromCurve(main.startRotation, out float minRot, out float maxRot);
-            Color c1 = main.startColor.colorMin;
-            Color c2 = main.startColor.colorMax;
-            Color cDead = colorOverLifetime.enabled && colorOverLifetime.color.mode == ParticleSystemGradientMode.Color ? colorOverLifetime.color.color : new Color(0, 0, 0, 0);
+            // Start color with correct alpha: in Color mode Unity often stores alpha only in the gradient; colorMin/Evaluate can return .a=0. Prefer gradient.Evaluate when available.
+            Color c1, c2;
+            var startGrad = main.startColor.mode == ParticleSystemGradientMode.Gradient || main.startColor.mode == ParticleSystemGradientMode.TwoGradients ? main.startColor.gradient : null;
+            var startGradMax = main.startColor.mode == ParticleSystemGradientMode.TwoGradients ? main.startColor.gradientMax : null;
+            if (main.startColor.mode == ParticleSystemGradientMode.Color && main.startColor.gradient != null)
+            {
+                Color single = main.startColor.gradient.Evaluate(0.5f);
+                c1 = c2 = single;
+            }
+            else if (startGrad != null)
+            {
+                c1 = startGrad.Evaluate(0f);
+                c2 = startGradMax != null ? startGradMax.Evaluate(1f) : startGrad.Evaluate(1f);
+            }
+            else
+            {
+                c1 = main.startColor.Evaluate(0f, 0f);
+                bool twoColorsOrGradients = main.startColor.mode == ParticleSystemGradientMode.TwoColors || main.startColor.mode == ParticleSystemGradientMode.TwoGradients;
+                c2 = twoColorsOrGradients ? main.startColor.Evaluate(0f, 1f) : main.startColor.Evaluate(1f, 0f);
+            }
+            // Fallback: if alpha still 0 (Unity quirk in some versions), take from colorMin/colorMax
+            if (c1.a <= 0f && c2.a <= 0f)
+            {
+                float a = main.startColor.colorMin.a > 0f ? main.startColor.colorMin.a : main.startColor.colorMax.a;
+                if (a > 0f) { c1 = new Color(c1.r, c1.g, c1.b, a); c2 = new Color(c2.r, c2.g, c2.b, a); }
+            }
+            // Death color: from Color over Lifetime — single Color mode uses .color; Gradient/TwoGradients use end of gradient (Evaluate(1,0))
+            Color cDead;
+            if (!colorOverLifetime.enabled)
+                cDead = new Color(0, 0, 0, 0);
+            else if (colorOverLifetime.color.mode == ParticleSystemGradientMode.Color)
+                cDead = colorOverLifetime.color.color;
+            else
+                cDead = colorOverLifetime.color.Evaluate(1f, 0f);
 
             // SystemBlock: name = particle system name; billBoardMode from renderer (Unity RenderMode = Billboard/Stretch/Horizontal/Vertical/Mesh/None)
             int renderMode = (int)(renderer != null ? renderer.renderMode : ParticleSystemRenderMode.Billboard);
             bool isBillboard = renderer == null || (renderMode != (int)ParticleSystemRenderMode.Mesh && renderMode != (int)ParticleSystemRenderMode.None);
+            int blendMode = GetBlendModeFromUnity(mat);
             var systemBlock = new SystemBlockJson
             {
                 customType = "BABYLON.SystemBlock",
@@ -369,7 +396,7 @@ namespace ShurikenToBabylonNpe
                 name = ps.name,
                 capacity = main.maxParticles,
                 manualEmitCount = GetManualEmitCountFromUnity(emission),
-                blendMode = GetBlendModeFromUnity(mat),
+                blendMode = blendMode,
                 updateSpeed = 0.0167f,
                 isBillboardBased = isBillboard,
                 billBoardMode = isBillboard ? Math.Min(renderMode, 3) : 0,
