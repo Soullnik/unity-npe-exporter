@@ -190,7 +190,7 @@ export interface IParticleGradientBlockSerialization extends IBaseBlockSerializa
 
 export interface IParticleGradientValueBlockSerialization extends IBaseBlockSerialization {
     customType: "BABYLON.ParticleGradientValueBlock";
-    reference: string;
+    reference: number;
 }
 
 export interface IParticleDebugBlockSerialization extends IBaseBlockSerialization {

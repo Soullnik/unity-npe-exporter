@@ -35,10 +35,10 @@ namespace ShurikenToBabylonNpe
         private const int BlendAdditive = 1;
         private const int BlendMultiply = 2;
 
-        // Layout by connection flow: left = sources, right = consumers. Each "frame" = inputs | block.
+        // Layout: grid in (col, row). All block positions go through NpeLayout so new blocks get stable positions.
         private const float LayoutStepX = 260f;
         private const float LayoutStepY = 80f;
-        private const float FrameHeight = 240f; // vertical space per frame (min+max+random or similar)
+        private const float FrameHeight = 240f; // 3 rows per frame (FrameHeight/LayoutStepY)
         private const int LayoutColInputs = 0;
         private const int LayoutColRandomLerp = 1;
         private const int LayoutColCreateParticle = 2;
@@ -48,7 +48,45 @@ namespace ShurikenToBabylonNpe
         private const int LayoutColUpdatePosition = 6;
         private const int LayoutColTexture = 7;
         private const int LayoutColSystem = 8;
-        private const float SystemLayoutWidth = 2400f; // 9 columns
+        private const float SystemLayoutWidth = 2400f;
+        // Row grid (row index * LayoutStepY = Y offset). Frames 0..8 = CreateParticle inputs; then Update blocks; then By Speed.
+        private const float RowFrame0 = 0f;
+        private const float RowFrame1 = 3f;
+        private const float RowFrame2 = 6f;
+        private const float RowFrame3 = 9f;   // CreateParticle, UpdatePosition, Shape, System
+        private const float RowFrame4 = 12f;
+        private const float RowFrame5 = 15f;
+        private const float RowFrame6 = 18f;  // Color over Lifetime
+        private const float RowFrame7 = 21f;   // Size over Lifetime
+        private const float RowFrame8 = 24f;   // Rotation over Lifetime
+        private const float RowUpdateColor = 11.25f;   // 900
+        private const float RowUpdateSize = 13.5f;      // 1080
+        private const float RowUpdateAngle = 15.75f;   // 1260
+        private const float RowPosition = 19f;         // 1520
+        private const float RowAdd = 19.5f;            // 1560
+        private const float RowScaledDir = 20f;       // 1600
+        private const float RowSpeedNorm = 21.25f;    // 1700
+        private const float RowSpeedNorm2 = 22.25f;    // 1780
+        private const float RowClampNorm = 23.25f;     // 1860
+        private const float RowColorBySpeed = 23.75f;  // 1900
+        private const float RowLerpColorBySpeed = 24.25f;  // 1940
+        private const float RowColorBySpeedEnd = 24.75f;  // 1980
+        private const float RowSizeBySpeed = 25.25f;  // 2020
+        private const float RowLerpSizeBySpeed = 25.75f;
+        private const float RowAngleBySpeed = 26.75f;  // 2140
+        private const float RowLerpAngleBySpeed = 27.25f;
+        private const float RowTexture = 10f;         // 800
+
+        /// <summary>NPE canvas grid: all positions via X(col), Y(row). Row in LayoutStepY units.</summary>
+        struct NpeLayout
+        {
+            public float BaseX;
+            public float BaseY;
+            public float X(int col) => BaseX + col * LayoutStepX;
+            public float Y(float row) => BaseY + row * LayoutStepY;
+            public float FrameRow(int frame, int subRow = 0) => frame * (FrameHeight / LayoutStepY) + subRow;
+            public void Loc(NodeParticleSystemSetJson set, int blockId, int col, float row) => AddLoc(set, blockId, X(col), Y(row));
+        }
 
         /// <summary>Convert single ParticleSystem to NodeParticleSystemSet (one SystemBlock).</summary>
         public static NodeParticleSystemSetJson Convert(UnityEngine.ParticleSystem ps, string setName = null, string defaultTextureUrl = null)
@@ -163,12 +201,126 @@ namespace ShurikenToBabylonNpe
             return BlendCombine;
         }
 
-        /// <summary>Get start/end color from Unity Color over Lifetime gradient (time 0 and 1).</summary>
-        static void GetColorOverLifetimeGradientEndpoints(ParticleSystem.ColorOverLifetimeModule colorOverLifetime, out Color start, out Color end)
+        /// <summary>Convert Unity Gradient to sorted list of (time 0..1, color) for NPE ParticleGradientBlock. Merges color and alpha key times, evaluates at each.</summary>
+        static void GetGradientStops(Gradient g, List<float> times, List<Color> colors)
         {
-            var gradient = colorOverLifetime.color;
-            start = gradient.Evaluate(0f, 0f);
-            end = gradient.Evaluate(1f, 0f);
+            times.Clear();
+            colors.Clear();
+            if (g == null) return;
+            var colorKeys = g.colorKeys;
+            var alphaKeys = g.alphaKeys;
+            var timeSet = new HashSet<float> { 0f, 1f };
+            for (int i = 0; i < colorKeys.Length; i++)
+                timeSet.Add(Mathf.Clamp01(colorKeys[i].time));
+            for (int i = 0; i < alphaKeys.Length; i++)
+                timeSet.Add(Mathf.Clamp01(alphaKeys[i].time));
+            var sortedTimes = new List<float>(timeSet);
+            sortedTimes.Sort();
+            for (int i = 0; i < sortedTimes.Count; i++)
+            {
+                float t = sortedTimes[i];
+                times.Add(t);
+                colors.Add(g.Evaluate(t));
+            }
+        }
+
+        /// <summary>Add ParticleGradientBlock + ParticleGradientValueBlocks for a Unity gradient; gradientSelectorBlockId (e.g. Age) drives 0..1. Returns gradient block id. When reservedGradientBlockId is set, uses that id for the gradient block. Row in grid units (LayoutStepY).</summary>
+        static int AddColorGradientBlockGroup(NodeParticleSystemSetJson set, Gradient unityGradient, int idGradientSelector, ref int nextId, NpeLayout layout, int colX, float rowBase, string blockNamePrefix, int? reservedGradientBlockId = null)
+        {
+            var times = new List<float>();
+            var colors = new List<Color>();
+            GetGradientStops(unityGradient, times, colors);
+            if (times.Count == 0) return 0;
+            int idGradientBlock = reservedGradientBlockId ?? NextId(ref nextId);
+            var valueBlockIds = new List<int>();
+            for (int i = 0; i < times.Count; i++)
+            {
+                int idColorIn = NextId(ref nextId);
+                int idVal = NextId(ref nextId);
+                valueBlockIds.Add(idVal);
+                AddInputBlockColor4(set, idColorIn, blockNamePrefix + " color " + i, colors[i].r, colors[i].g, colors[i].b, colors[i].a, layout, colX, rowBase + i);
+                var vb = new ParticleGradientValueBlockJson
+                {
+                    customType = "BABYLON.ParticleGradientValueBlock",
+                    id = idVal,
+                    name = blockNamePrefix + " value " + i,
+                    reference = times[i]  // gradient key 0..1 for this color stop
+                };
+                vb.inputs.Add(Connection("value", idColorIn, "output"));
+                vb.outputs.Add(Out("output"));
+                set.blocks.Add(vb);
+                layout.Loc(set, idVal, colX + 1, rowBase + i);
+            }
+            var gb = new ParticleGradientBlockJson
+            {
+                customType = "BABYLON.ParticleGradientBlock",
+                id = idGradientBlock,
+                name = blockNamePrefix + " gradient",
+                _entryCount = times.Count
+            };
+            gb.inputs.Add(Connection("gradient", idGradientSelector, "output"));
+            for (int i = 0; i < valueBlockIds.Count; i++)
+                gb.inputs.Add(Connection("value" + i, valueBlockIds[i], "output"));
+            gb.outputs.Add(Out("output"));
+            set.blocks.Add(gb);
+            layout.Loc(set, idGradientBlock, colX + 1, rowBase + times.Count);
+            return idGradientBlock;
+        }
+
+        /// <summary>Get gradient end color for cDead (Evaluate(1)).</summary>
+        static Color GetGradientEndColor(Gradient g)
+        {
+            return g != null ? g.Evaluate(1f) : new Color(0, 0, 0, 0);
+        }
+
+        /// <summary>Get start/end from MinMaxGradient (fallback when gradient is null; e.g. Color by Speed).</summary>
+        static void GetMinMaxGradientEndpoints(ParticleSystem.MinMaxGradient mm, out Color start, out Color end)
+        {
+            start = mm.Evaluate(0f, 0f);
+            end = mm.Evaluate(1f, 0f);
+            if (start.a <= 0f && end.a <= 0f && mm.gradient != null)
+            {
+                start = mm.gradient.Evaluate(0f);
+                end = mm.gradient.Evaluate(1f);
+            }
+        }
+
+        /// <summary>Log Color over Lifetime diagnostics (mode, gradient keys, alpha, start/end/cDead) for debugging export.</summary>
+        static void LogColorOverLifetimeDiagnostics(ParticleSystem.ColorOverLifetimeModule colorOverLifetime, Color colStart, Color colEnd, Color cDead)
+        {
+            if (!colorOverLifetime.enabled) return;
+            var mm = colorOverLifetime.color;
+            Debug.Log("[ColorOverLifetime] --- DIAG START ---");
+            Debug.Log("[ColorOverLifetime] mode=" + mm.mode + " (Gradient or TwoGradients for this module)");
+            Debug.Log("[ColorOverLifetime] gradient=" + (mm.gradient != null ? "set" : "null") + " gradientMax=" + (mm.gradientMax != null ? "set" : "null"));
+            void LogGradient(string label, Gradient g)
+            {
+                if (g == null) { Debug.Log("[ColorOverLifetime] " + label + "=null"); return; }
+                var cKeys = g.colorKeys;
+                var aKeys = g.alphaKeys;
+                Debug.Log("[ColorOverLifetime] " + label + " colorKeys=" + cKeys.Length + " alphaKeys=" + aKeys.Length);
+                for (int i = 0; i < cKeys.Length; i++)
+                    Debug.Log(string.Format("[ColorOverLifetime]   colorKey[{0}] time={1} r={2} g={3} b={4} a={5}", i, cKeys[i].time, cKeys[i].color.r, cKeys[i].color.g, cKeys[i].color.b, cKeys[i].color.a));
+                for (int i = 0; i < aKeys.Length; i++)
+                    Debug.Log(string.Format("[ColorOverLifetime]   alphaKey[{0}] time={1} alpha={2}", i, aKeys[i].time, aKeys[i].alpha));
+                Debug.Log(string.Format("[ColorOverLifetime]   Evaluate(0)=({0},{1},{2},{3}) Evaluate(1)=({4},{5},{6},{7})",
+                    g.Evaluate(0f).r, g.Evaluate(0f).g, g.Evaluate(0f).b, g.Evaluate(0f).a,
+                    g.Evaluate(1f).r, g.Evaluate(1f).g, g.Evaluate(1f).b, g.Evaluate(1f).a));
+            }
+            LogGradient("gradient", mm.gradient);
+            LogGradient("gradientMax", mm.gradientMax);
+            Debug.Log(string.Format("[ColorOverLifetime] mm.Evaluate(0,0)=({0},{1},{2},{3}) mm.Evaluate(1,0)=({4},{5},{6},{7})",
+                mm.Evaluate(0f, 0f).r, mm.Evaluate(0f, 0f).g, mm.Evaluate(0f, 0f).b, mm.Evaluate(0f, 0f).a,
+                mm.Evaluate(1f, 0f).r, mm.Evaluate(1f, 0f).g, mm.Evaluate(1f, 0f).b, mm.Evaluate(1f, 0f).a));
+            if (mm.mode == ParticleSystemGradientMode.TwoGradients && mm.gradientMax != null)
+                Debug.Log(string.Format("[ColorOverLifetime] mm.Evaluate(0,1)=({0},{1},{2},{3}) mm.Evaluate(1,1)=({4},{5},{6},{7})",
+                    mm.Evaluate(0f, 1f).r, mm.Evaluate(0f, 1f).g, mm.Evaluate(0f, 1f).b, mm.Evaluate(0f, 1f).a,
+                    mm.Evaluate(1f, 1f).r, mm.Evaluate(1f, 1f).g, mm.Evaluate(1f, 1f).b, mm.Evaluate(1f, 1f).a));
+            Debug.Log(string.Format("[ColorOverLifetime] EXPORT colStart=({0},{1},{2},{3}) colEnd=({4},{5},{6},{7})",
+                colStart.r, colStart.g, colStart.b, colStart.a, colEnd.r, colEnd.g, colEnd.b, colEnd.a));
+            Debug.Log(string.Format("[ColorOverLifetime] EXPORT cDead=({0},{1},{2},{3}) (gradient end)",
+                cDead.r, cDead.g, cDead.b, cDead.a));
+            Debug.Log("[ColorOverLifetime] --- DIAG END ---");
         }
 
         /// <summary>Encode Unity texture to data URL (data:image/png;base64,...). Returns null if not a readable Texture2D or readable RenderTexture.</summary>
@@ -226,23 +378,77 @@ namespace ShurikenToBabylonNpe
             }
         }
 
-        /// <summary>Get min/max from Unity MinMaxCurve. Uses mode: Constant = one value for both, TwoConstants = constantMin/Max, else Evaluate.</summary>
-        static void GetMinMaxFromCurve(ParticleSystem.MinMaxCurve curve, out float minVal, out float maxVal)
+        /// <summary>Export shape for a MinMaxCurve: Constant (one value), TwoConstants (min/max), Curve/TwoCurves (sampled min/max).</summary>
+        struct MinMaxCurveExport
         {
+            public ParticleSystemCurveMode Mode;
+            public float MinValue;
+            public float MaxValue;
+            public bool IsConstant => Mode == ParticleSystemCurveMode.Constant;
+        }
+
+        /// <summary>Fills export from Unity MinMaxCurve. Constant = one value; TwoConstants = constantMin/constantMax; Curve/TwoCurves = sampled min/max.</summary>
+        static void GetMinMaxCurveExport(ParticleSystem.MinMaxCurve curve, out MinMaxCurveExport export)
+        {
+            export = new MinMaxCurveExport { Mode = curve.mode };
             switch (curve.mode)
             {
                 case ParticleSystemCurveMode.Constant:
-                    minVal = maxVal = curve.constant;
-                    break;
+                    export.MinValue = export.MaxValue = curve.constant;
+                    return;
                 case ParticleSystemCurveMode.TwoConstants:
-                    minVal = curve.constantMin;
-                    maxVal = curve.constantMax;
-                    break;
+                    export.MinValue = curve.constantMin;
+                    export.MaxValue = curve.constantMax;
+                    return;
+                case ParticleSystemCurveMode.Curve:
+                    SampleCurveMinMax(curve, 0f, out export.MinValue, out export.MaxValue);
+                    return;
+                case ParticleSystemCurveMode.TwoCurves:
+                    SampleTwoCurvesMinMax(curve, out export.MinValue, out export.MaxValue);
+                    return;
                 default:
-                    minVal = curve.Evaluate(0f, 0f);
-                    maxVal = curve.Evaluate(1f, 0f);
+                    export.MinValue = curve.Evaluate(0f, 0f);
+                    export.MaxValue = curve.Evaluate(1f, 0f);
                     break;
             }
+        }
+
+        /// <summary>Sample single curve at several times and set min/max.</summary>
+        static void SampleCurveMinMax(ParticleSystem.MinMaxCurve curve, float curveIndex, out float minVal, out float maxVal)
+        {
+            minVal = maxVal = curve.Evaluate(0f, curveIndex);
+            for (int i = 1; i <= 8; i++)
+            {
+                float t = i / 8f;
+                float v = curve.Evaluate(t, curveIndex);
+                if (v < minVal) minVal = v;
+                if (v > maxVal) maxVal = v;
+            }
+        }
+
+        /// <summary>Sample both curves over time; min/max are the overall range (for NPE we export as min+max+random).</summary>
+        static void SampleTwoCurvesMinMax(ParticleSystem.MinMaxCurve curve, out float minVal, out float maxVal)
+        {
+            minVal = float.MaxValue;
+            maxVal = float.MinValue;
+            for (int i = 0; i <= 8; i++)
+            {
+                float t = i / 8f;
+                float v0 = curve.Evaluate(t, 0f);
+                float v1 = curve.Evaluate(t, 1f);
+                if (v0 < minVal) minVal = v0;
+                if (v1 < minVal) minVal = v1;
+                if (v0 > maxVal) maxVal = v0;
+                if (v1 > maxVal) maxVal = v1;
+            }
+        }
+
+        /// <summary>Get min/max from Unity MinMaxCurve (convenience wrapper around GetMinMaxCurveExport).</summary>
+        static void GetMinMaxFromCurve(ParticleSystem.MinMaxCurve curve, out float minVal, out float maxVal)
+        {
+            GetMinMaxCurveExport(curve, out MinMaxCurveExport e);
+            minVal = e.MinValue;
+            maxVal = e.MaxValue;
         }
 
         static void AddSystemToSet(NodeParticleSystemSetJson set, UnityEngine.ParticleSystem ps, string defaultTextureUrl, ref int nextId, float baseX, float baseY)
@@ -306,16 +512,34 @@ namespace ShurikenToBabylonNpe
             int idColorStep = NextId(ref nextId);
             int idLerpColor = NextId(ref nextId);
             int idColorDead = NextId(ref nextId);
+            int idStartColorRandMin = 0, idStartColorRandMax = 0, idRandomStartColorPos = 0, idStartColorGradient = 0, idStartColorGradient2 = 0, idRandomStartColorWhich = 0, idLerpStartColorGradientsTwo = 0;
+            bool startColorIsGradient = main.startColor.mode == ParticleSystemGradientMode.Gradient;
+            bool startColorIsTwoGradients = main.startColor.mode == ParticleSystemGradientMode.TwoGradients;
+            if (startColorIsGradient || startColorIsTwoGradients)
+            {
+                idStartColorRandMin = NextId(ref nextId);
+                idStartColorRandMax = NextId(ref nextId);
+                idRandomStartColorPos = NextId(ref nextId);
+                idStartColorGradient = NextId(ref nextId);
+                if (startColorIsTwoGradients)
+                {
+                    idStartColorGradient2 = NextId(ref nextId);
+                    idRandomStartColorWhich = NextId(ref nextId);
+                    idLerpStartColorGradientsTwo = NextId(ref nextId);
+                }
+            }
             int idTexture = NextId(ref nextId);
-            int idUpdateColor = 0, idAge = 0, idColorOverLifetimeStart = 0, idColorOverLifetimeEnd = 0, idLerpColorOverLifetime = 0;
+            int idUpdateColor = 0, idAge = 0, idColorOverLifetimeSource = 0, idRandomColorGradTwo = 0, idLerpColorGradientsTwo = 0;
             int idUpdateSize = 0, idSizeOverLifetimeStart = 0, idSizeOverLifetimeEnd = 0, idLerpSizeOverLifetime = 0, idAgeForSize = 0;
             if (colorOverLifetime.enabled)
             {
                 idUpdateColor = NextId(ref nextId);
                 idAge = NextId(ref nextId);
-                idColorOverLifetimeStart = NextId(ref nextId);
-                idColorOverLifetimeEnd = NextId(ref nextId);
-                idLerpColorOverLifetime = NextId(ref nextId);
+                if (colorOverLifetime.color.mode == ParticleSystemGradientMode.TwoGradients)
+                {
+                    idRandomColorGradTwo = NextId(ref nextId);
+                    idLerpColorGradientsTwo = NextId(ref nextId);
+                }
             }
             if (sizeOverLifetime.enabled)
             {
@@ -337,19 +561,30 @@ namespace ShurikenToBabylonNpe
             bool needSpeedNorm = (colorBySpeed.enabled && !colorOverLifetime.enabled) || (sizeBySpeed.enabled && !sizeOverLifetime.enabled) || (rotationBySpeed.enabled && !rotationOverLifetime.enabled);
             int idDirScale = 0, idSpeedMinConst = 0, idSubSpeedMin = 0, idRangeSize = 0, idDivNorm = 0, idClampNorm = 0;
             if (needSpeedNorm) { idDirScale = NextId(ref nextId); idSpeedMinConst = NextId(ref nextId); idSubSpeedMin = NextId(ref nextId); idRangeSize = NextId(ref nextId); idDivNorm = NextId(ref nextId); idClampNorm = NextId(ref nextId); }
-            int idColorBySpeedStart = 0, idColorBySpeedEnd = 0, idLerpColorBySpeed = 0, idUpdateColorBySpeed = 0;
-            if (colorBySpeed.enabled && !colorOverLifetime.enabled) { idColorBySpeedStart = NextId(ref nextId); idColorBySpeedEnd = NextId(ref nextId); idLerpColorBySpeed = NextId(ref nextId); idUpdateColorBySpeed = NextId(ref nextId); }
+            int idColorBySpeedStart = 0, idColorBySpeedEnd = 0, idLerpColorBySpeed = 0, idUpdateColorBySpeed = 0, idColorBySpeedSource = 0, idRandomColorBySpeedTwo = 0, idLerpColorBySpeedTwo = 0;
+            if (colorBySpeed.enabled && !colorOverLifetime.enabled)
+            {
+                idColorBySpeedStart = NextId(ref nextId);
+                idColorBySpeedEnd = NextId(ref nextId);
+                idLerpColorBySpeed = NextId(ref nextId);
+                idUpdateColorBySpeed = NextId(ref nextId);
+                if (colorBySpeed.color.mode == ParticleSystemGradientMode.TwoGradients)
+                {
+                    idRandomColorBySpeedTwo = NextId(ref nextId);
+                    idLerpColorBySpeedTwo = NextId(ref nextId);
+                }
+            }
             int idSizeBySpeedStart = 0, idSizeBySpeedEnd = 0, idLerpSizeBySpeed = 0, idUpdateSizeBySpeed = 0;
             if (sizeBySpeed.enabled && !sizeOverLifetime.enabled) { idSizeBySpeedStart = NextId(ref nextId); idSizeBySpeedEnd = NextId(ref nextId); idLerpSizeBySpeed = NextId(ref nextId); idUpdateSizeBySpeed = NextId(ref nextId); }
             int idAngleBySpeedStart = 0, idAngleBySpeedEnd = 0, idLerpAngleBySpeed = 0, idUpdateAngleBySpeed = 0;
             if (rotationBySpeed.enabled && !rotationOverLifetime.enabled) { idAngleBySpeedStart = NextId(ref nextId); idAngleBySpeedEnd = NextId(ref nextId); idLerpAngleBySpeed = NextId(ref nextId); idUpdateAngleBySpeed = NextId(ref nextId); }
 
-            float fy(int frame) => frame * FrameHeight;
+            var layout = new NpeLayout { BaseX = baseX, BaseY = baseY };
 
-            GetMinMaxFromCurve(main.startLifetime, out float minLife, out float maxLife);
-            GetMinMaxFromCurve(main.startSpeed, out float minSpeed, out float maxSpeed);
-            GetMinMaxFromCurve(main.startSize, out float minSize, out float maxSize);
-            GetMinMaxFromCurve(main.startRotation, out float minRot, out float maxRot);
+            GetMinMaxCurveExport(main.startLifetime, out MinMaxCurveExport exportLifetime);
+            GetMinMaxCurveExport(main.startSpeed, out MinMaxCurveExport exportEmitPower);
+            GetMinMaxCurveExport(main.startSize, out MinMaxCurveExport exportSize);
+            GetMinMaxCurveExport(main.startRotation, out MinMaxCurveExport exportAngle);
             // Start color with correct alpha: in Color mode Unity often stores alpha only in the gradient; colorMin/Evaluate can return .a=0. Prefer gradient.Evaluate when available.
             Color c1, c2;
             var startGrad = main.startColor.mode == ParticleSystemGradientMode.Gradient || main.startColor.mode == ParticleSystemGradientMode.TwoGradients ? main.startColor.gradient : null;
@@ -376,14 +611,20 @@ namespace ShurikenToBabylonNpe
                 float a = main.startColor.colorMin.a > 0f ? main.startColor.colorMin.a : main.startColor.colorMax.a;
                 if (a > 0f) { c1 = new Color(c1.r, c1.g, c1.b, a); c2 = new Color(c2.r, c2.g, c2.b, a); }
             }
-            // Death color: from Color over Lifetime — single Color mode uses .color; Gradient/TwoGradients use end of gradient (Evaluate(1,0))
+            // Death color: from Color over Lifetime gradient end (Gradient or TwoGradients).
             Color cDead;
             if (!colorOverLifetime.enabled)
                 cDead = new Color(0, 0, 0, 0);
-            else if (colorOverLifetime.color.mode == ParticleSystemGradientMode.Color)
-                cDead = colorOverLifetime.color.color;
             else
-                cDead = colorOverLifetime.color.Evaluate(1f, 0f);
+            {
+                var mm = colorOverLifetime.color;
+                if (mm.mode == ParticleSystemGradientMode.TwoGradients && mm.gradientMax != null)
+                    cDead = GetGradientEndColor(mm.gradientMax);
+                else if (mm.gradient != null)
+                    cDead = GetGradientEndColor(mm.gradient);
+                else
+                    cDead = mm.Evaluate(1f, 0f);
+            }
 
             // SystemBlock: name = particle system name; billBoardMode from renderer (Unity RenderMode = Billboard/Stretch/Horizontal/Vertical/Mesh/None)
             int renderMode = (int)(renderer != null ? renderer.renderMode : ParticleSystemRenderMode.Billboard);
@@ -423,7 +664,7 @@ namespace ShurikenToBabylonNpe
             systemBlock.inputs.Add(EmptyInput("onStart"));
             systemBlock.inputs.Add(EmptyInput("onEnd"));
             systemBlock.outputs.Add(Out("system"));
-            AddLoc(set, idSystem, baseX + LayoutColSystem * LayoutStepX, baseY + 720f);
+            layout.Loc(set, idSystem, LayoutColSystem, RowFrame3);
             set.blocks.Add(systemBlock);
 
             // UpdatePositionBlock: position = Add(Position, ScaledDirection)
@@ -436,13 +677,12 @@ namespace ShurikenToBabylonNpe
             updatePos.inputs.Add(Connection("particle", idShape, "output"));
             updatePos.inputs.Add(Connection("position", idAdd, "output"));
             updatePos.outputs.Add(Out("output"));
-            AddLoc(set, idUpdatePosition, baseX + LayoutColUpdatePosition * LayoutStepX, baseY + 720f);
+            layout.Loc(set, idUpdatePosition, LayoutColUpdatePosition, RowFrame3);
             set.blocks.Add(updatePos);
 
-            // Color over Lifetime: UpdateColorBlock (particle from UpdatePosition, color from Lerp(start, end, age gradient))
+            // Color over Lifetime: UpdateColorBlock (particle from UpdatePosition, color from ParticleGradientBlock(age) or TwoGradients: Lerp(grad1, grad2, random))
             if (colorOverLifetime.enabled)
             {
-                GetColorOverLifetimeGradientEndpoints(colorOverLifetime, out Color colStart, out Color colEnd);
                 var ageGradientInput = new ParticleInputBlockJson
                 {
                     customType = "BABYLON.ParticleInputBlock",
@@ -458,12 +698,37 @@ namespace ShurikenToBabylonNpe
                 };
                 ageGradientInput.outputs.Add(Out("output"));
                 set.blocks.Add(ageGradientInput);
-                AddLoc(set, idAge, baseX + LayoutColInputs * LayoutStepX, baseY + fy(6));
+                layout.Loc(set, idAge, LayoutColInputs, RowFrame6);
 
-                AddInputBlockColor4(set, idColorOverLifetimeStart, "Color over lifetime (start)", colStart.r, colStart.g, colStart.b, colStart.a, baseX, baseY, LayoutColInputs, fy(6) + LayoutStepY);
-                AddInputBlockColor4(set, idColorOverLifetimeEnd, "Color over lifetime (end)", colEnd.r, colEnd.g, colEnd.b, colEnd.a, baseX, baseY, LayoutColInputs, fy(6) + 2 * LayoutStepY);
-                AddLerpBlock(set, idLerpColorOverLifetime, "Lerp color over lifetime", idColorOverLifetimeStart, idColorOverLifetimeEnd, idAge);
-                AddLoc(set, idLerpColorOverLifetime, baseX + LayoutColRandomLerp * LayoutStepX, baseY + fy(6) + LayoutStepY);
+                var mmCol = colorOverLifetime.color;
+                if (mmCol.mode == ParticleSystemGradientMode.TwoGradients && mmCol.gradient != null && mmCol.gradientMax != null)
+                {
+                    int idGrad1 = AddColorGradientBlockGroup(set, mmCol.gradient, idAge, ref nextId, layout, LayoutColInputs, layout.FrameRow(6, 1), "Color over lifetime 1");
+                    int idGrad2 = AddColorGradientBlockGroup(set, mmCol.gradientMax, idAge, ref nextId, layout, LayoutColInputs + 2, layout.FrameRow(6, 1), "Color over lifetime 2");
+                    AddRandomBlock(set, idRandomColorGradTwo, "Random color gradient", 0, 1, LockOncePerParticle);
+                    layout.Loc(set, idRandomColorGradTwo, LayoutColInputs, layout.FrameRow(6, 3));
+                    AddLerpBlock(set, idLerpColorGradientsTwo, "Lerp color gradients", idGrad1, idGrad2, idRandomColorGradTwo);
+                    layout.Loc(set, idLerpColorGradientsTwo, LayoutColRandomLerp, layout.FrameRow(6, 1));
+                    idColorOverLifetimeSource = idLerpColorGradientsTwo;
+                }
+                else if (mmCol.gradient != null)
+                {
+                    idColorOverLifetimeSource = AddColorGradientBlockGroup(set, mmCol.gradient, idAge, ref nextId, layout, LayoutColInputs, layout.FrameRow(6, 1), "Color over lifetime");
+                }
+                else
+                {
+                    Color fallbackStart = mmCol.Evaluate(0f, 0f), fallbackEnd = mmCol.Evaluate(1f, 0f);
+                    int idStart = NextId(ref nextId), idEnd = NextId(ref nextId), idLerp = NextId(ref nextId);
+                    AddInputBlockColor4(set, idStart, "Color over lifetime (start)", fallbackStart.r, fallbackStart.g, fallbackStart.b, fallbackStart.a, layout, LayoutColInputs, layout.FrameRow(6, 1));
+                    AddInputBlockColor4(set, idEnd, "Color over lifetime (end)", fallbackEnd.r, fallbackEnd.g, fallbackEnd.b, fallbackEnd.a, layout, LayoutColInputs, layout.FrameRow(6, 2));
+                    AddLerpBlock(set, idLerp, "Lerp color over lifetime", idStart, idEnd, idAge);
+                    layout.Loc(set, idLerp, LayoutColRandomLerp, layout.FrameRow(6, 1));
+                    idColorOverLifetimeSource = idLerp;
+                }
+
+                Color diagStart = mmCol.gradient != null ? mmCol.gradient.Evaluate(0f) : mmCol.Evaluate(0f, 0f);
+                Color diagEnd = (mmCol.mode == ParticleSystemGradientMode.TwoGradients && mmCol.gradientMax != null) ? mmCol.gradientMax.Evaluate(1f) : (mmCol.gradient != null ? mmCol.gradient.Evaluate(1f) : mmCol.Evaluate(1f, 0f));
+                LogColorOverLifetimeDiagnostics(colorOverLifetime, diagStart, diagEnd, cDead);
 
                 var updateColor = new UpdateColorBlockJson
                 {
@@ -472,10 +737,10 @@ namespace ShurikenToBabylonNpe
                     name = "Update color"
                 };
                 updateColor.inputs.Add(Connection("particle", idUpdatePosition, "output"));
-                updateColor.inputs.Add(Connection("color", idLerpColorOverLifetime, "output"));
+                updateColor.inputs.Add(Connection("color", idColorOverLifetimeSource, "output"));
                 updateColor.outputs.Add(Out("output"));
                 set.blocks.Add(updateColor);
-                AddLoc(set, idUpdateColor, baseX + LayoutColUpdatePosition * LayoutStepX, baseY + 900f);
+                layout.Loc(set, idUpdateColor, LayoutColUpdatePosition, RowUpdateColor);
             }
 
             // Size over Lifetime: UpdateSizeBlock (particle from chain, size from Lerp(sizeStart, sizeEnd, age))
@@ -501,12 +766,12 @@ namespace ShurikenToBabylonNpe
                     };
                     ageGradientInput.outputs.Add(Out("output"));
                     set.blocks.Add(ageGradientInput);
-                    AddLoc(set, idAgeForSize, baseX + LayoutColInputs * LayoutStepX, baseY + fy(7));
+                    layout.Loc(set, idAgeForSize, LayoutColInputs, RowFrame7);
                 }
-                AddInputBlock(set, idSizeOverLifetimeStart, "Size over lifetime (start)", sizeStart, baseX, baseY, LayoutColInputs, colorOverLifetime.enabled ? fy(7) : fy(7) + LayoutStepY);
-                AddInputBlock(set, idSizeOverLifetimeEnd, "Size over lifetime (end)", sizeEnd, baseX, baseY, LayoutColInputs, colorOverLifetime.enabled ? fy(7) + LayoutStepY : fy(7) + 2 * LayoutStepY);
+                AddInputBlock(set, idSizeOverLifetimeStart, "Size over lifetime (start)", sizeStart, layout, LayoutColInputs, colorOverLifetime.enabled ? RowFrame7 : layout.FrameRow(7, 1));
+                AddInputBlock(set, idSizeOverLifetimeEnd, "Size over lifetime (end)", sizeEnd, layout, LayoutColInputs, colorOverLifetime.enabled ? layout.FrameRow(7, 1) : layout.FrameRow(7, 2));
                 AddLerpBlock(set, idLerpSizeOverLifetime, "Lerp size over lifetime", idSizeOverLifetimeStart, idSizeOverLifetimeEnd, ageBlockId);
-                AddLoc(set, idLerpSizeOverLifetime, baseX + LayoutColRandomLerp * LayoutStepX, baseY + fy(7) + LayoutStepY);
+                layout.Loc(set, idLerpSizeOverLifetime, LayoutColRandomLerp, layout.FrameRow(7, 1));
 
                 int chainHeadForSize = colorOverLifetime.enabled ? idUpdateColor : idUpdatePosition;
                 var updateSize = new UpdateSizeBlockJson
@@ -519,7 +784,7 @@ namespace ShurikenToBabylonNpe
                 updateSize.inputs.Add(Connection("size", idLerpSizeOverLifetime, "output"));
                 updateSize.outputs.Add(Out("output"));
                 set.blocks.Add(updateSize);
-                AddLoc(set, idUpdateSize, baseX + LayoutColUpdatePosition * LayoutStepX, baseY + (colorOverLifetime.enabled ? 1080f : 900f));
+                layout.Loc(set, idUpdateSize, LayoutColUpdatePosition, colorOverLifetime.enabled ? RowUpdateSize : RowUpdateColor);
             }
 
             // Rotation over Lifetime: UpdateAngleBlock (particle from chain, angle from Lerp(angle0, angle1, age gradient)). Unity uses angular velocity (deg/s); we approximate as angle at 0 and 1.
@@ -534,19 +799,19 @@ namespace ShurikenToBabylonNpe
                     var ageRotInput = new ParticleInputBlockJson { customType = "BABYLON.ParticleInputBlock", id = idAgeRot, name = "Age gradient (rotation)", type = TypeFloat, contextualValue = ContextAgeGradient, systemSource = 0, min = 0, max = 0, groupInInspector = "", displayInInspector = true };
                     ageRotInput.outputs.Add(Out("output"));
                     set.blocks.Add(ageRotInput);
-                    AddLoc(set, idAgeRot, baseX + LayoutColInputs * LayoutStepX, baseY + fy(8));
+                    layout.Loc(set, idAgeRot, LayoutColInputs, RowFrame8);
                 }
-                AddInputBlock(set, idAngleRotStart, "Rotation over lifetime (start)", angle0, baseX, baseY, LayoutColInputs, baseY + fy(8) + LayoutStepY);
-                AddInputBlock(set, idAngleRotEnd, "Rotation over lifetime (end)", angle1, baseX, baseY, LayoutColInputs, baseY + fy(8) + 2 * LayoutStepY);
+                AddInputBlock(set, idAngleRotStart, "Rotation over lifetime (start)", angle0, layout, LayoutColInputs, layout.FrameRow(8, 1));
+                AddInputBlock(set, idAngleRotEnd, "Rotation over lifetime (end)", angle1, layout, LayoutColInputs, layout.FrameRow(8, 2));
                 AddLerpBlock(set, idLerpAngleRot, "Lerp angle over lifetime", idAngleRotStart, idAngleRotEnd, ageRotId);
-                AddLoc(set, idLerpAngleRot, baseX + LayoutColRandomLerp * LayoutStepX, baseY + fy(8) + LayoutStepY);
+                layout.Loc(set, idLerpAngleRot, LayoutColRandomLerp, layout.FrameRow(8, 1));
                 int chainHeadForAngle = sizeOverLifetime.enabled ? idUpdateSize : (colorOverLifetime.enabled ? idUpdateColor : idUpdatePosition);
                 var updateAngle = new UpdateAngleBlockJson { customType = "BABYLON.UpdateAngleBlock", id = idUpdateAngle, name = "Update angle" };
                 updateAngle.inputs.Add(Connection("particle", chainHeadForAngle, "output"));
                 updateAngle.inputs.Add(Connection("angle", idLerpAngleRot, "output"));
                 updateAngle.outputs.Add(Out("output"));
                 set.blocks.Add(updateAngle);
-                AddLoc(set, idUpdateAngle, baseX + LayoutColUpdatePosition * LayoutStepX, baseY + (sizeOverLifetime.enabled ? 1260f : (colorOverLifetime.enabled ? 1080f : 900f)));
+                layout.Loc(set, idUpdateAngle, LayoutColUpdatePosition, sizeOverLifetime.enabled ? RowUpdateAngle : (colorOverLifetime.enabled ? RowUpdateSize : RowUpdateColor));
             }
 
             // By Speed: shared speed normalization (Direction scale -> Subtract(min) -> Divide(range) -> Clamp(0,1)), then per-module Lerp + Update.
@@ -571,80 +836,98 @@ namespace ShurikenToBabylonNpe
                 };
                 dirScaleInput.outputs.Add(Out("output"));
                 set.blocks.Add(dirScaleInput);
-                AddLoc(set, idDirScale, baseX + LayoutColPositionDir * LayoutStepX, baseY + 1700f);
+                layout.Loc(set, idDirScale, LayoutColPositionDir, RowSpeedNorm);
 
-                AddInputBlock(set, idSpeedMinConst, "Speed range min", speedMin, baseX, baseY, LayoutColInputs, 1700f);
-                AddInputBlock(set, idRangeSize, "Speed range size", rangeSize, baseX, baseY, LayoutColInputs, 1780f);
+                AddInputBlock(set, idSpeedMinConst, "Speed range min", speedMin, layout, LayoutColInputs, RowSpeedNorm);
+                AddInputBlock(set, idRangeSize, "Speed range size", rangeSize, layout, LayoutColInputs, RowSpeedNorm2);
 
                 var subBlock = new ParticleMathBlockJson { customType = "BABYLON.ParticleMathBlock", id = idSubSpeedMin, name = "Speed minus min", operation = MathSubtract };
                 subBlock.inputs.Add(Connection("left", idDirScale, "output"));
                 subBlock.inputs.Add(Connection("right", idSpeedMinConst, "output"));
                 subBlock.outputs.Add(Out("output"));
                 set.blocks.Add(subBlock);
-                AddLoc(set, idSubSpeedMin, baseX + LayoutColRandomLerp * LayoutStepX, baseY + 1700f);
+                layout.Loc(set, idSubSpeedMin, LayoutColRandomLerp, RowSpeedNorm);
 
                 var divBlock = new ParticleMathBlockJson { customType = "BABYLON.ParticleMathBlock", id = idDivNorm, name = "Normalized speed", operation = MathDivide };
                 divBlock.inputs.Add(Connection("left", idSubSpeedMin, "output"));
                 divBlock.inputs.Add(Connection("right", idRangeSize, "output"));
                 divBlock.outputs.Add(Out("output"));
                 set.blocks.Add(divBlock);
-                AddLoc(set, idDivNorm, baseX + LayoutColRandomLerp * LayoutStepX, baseY + 1780f);
+                layout.Loc(set, idDivNorm, LayoutColRandomLerp, RowSpeedNorm2);
 
                 var clampBlock = new ParticleClampBlockJson { customType = "BABYLON.ParticleClampBlock", id = idClampNorm, name = "Clamp speed 0-1", minimum = 0f, maximum = 1f };
                 clampBlock.inputs.Add(Connection("value", idDivNorm, "output"));
                 clampBlock.outputs.Add(Out("output"));
                 set.blocks.Add(clampBlock);
-                AddLoc(set, idClampNorm, baseX + LayoutColRandomLerp * LayoutStepX, baseY + 1860f);
+                layout.Loc(set, idClampNorm, LayoutColRandomLerp, RowClampNorm);
             }
 
             if (colorBySpeed.enabled && !colorOverLifetime.enabled)
             {
-                Color colStart = colorBySpeed.color.Evaluate(0f, 0f);
-                Color colEnd = colorBySpeed.color.Evaluate(1f, 0f);
-                AddInputBlockColor4(set, idColorBySpeedStart, "Color by speed (start)", colStart.r, colStart.g, colStart.b, colStart.a, baseX, baseY, LayoutColInputs, baseY + 1900f);
-                AddInputBlockColor4(set, idColorBySpeedEnd, "Color by speed (end)", colEnd.r, colEnd.g, colEnd.b, colEnd.a, baseX, baseY, LayoutColInputs, baseY + 1980f);
-                AddLerpBlock(set, idLerpColorBySpeed, "Lerp color by speed", idColorBySpeedStart, idColorBySpeedEnd, idClampNorm);
-                AddLoc(set, idLerpColorBySpeed, baseX + LayoutColRandomLerp * LayoutStepX, baseY + 1940f);
+                var mmSpeed = colorBySpeed.color;
+                if (mmSpeed.mode == ParticleSystemGradientMode.TwoGradients && mmSpeed.gradient != null && mmSpeed.gradientMax != null)
+                {
+                    int idGrad1 = AddColorGradientBlockGroup(set, mmSpeed.gradient, idClampNorm, ref nextId, layout, LayoutColInputs, RowColorBySpeed, "Color by speed 1");
+                    int idGrad2 = AddColorGradientBlockGroup(set, mmSpeed.gradientMax, idClampNorm, ref nextId, layout, LayoutColInputs + 2, RowColorBySpeed, "Color by speed 2");
+                    AddRandomBlock(set, idRandomColorBySpeedTwo, "Random color by speed", 0, 1, LockOncePerParticle);
+                    layout.Loc(set, idRandomColorBySpeedTwo, LayoutColInputs, RowLerpSizeBySpeed);
+                    AddLerpBlock(set, idLerpColorBySpeedTwo, "Lerp color by speed gradients", idGrad1, idGrad2, idRandomColorBySpeedTwo);
+                    layout.Loc(set, idLerpColorBySpeedTwo, LayoutColRandomLerp, RowLerpColorBySpeed);
+                    idColorBySpeedSource = idLerpColorBySpeedTwo;
+                }
+                else if (mmSpeed.gradient != null)
+                {
+                    idColorBySpeedSource = AddColorGradientBlockGroup(set, mmSpeed.gradient, idClampNorm, ref nextId, layout, LayoutColInputs, RowColorBySpeed, "Color by speed");
+                }
+                else
+                {
+                    GetMinMaxGradientEndpoints(colorBySpeed.color, out Color colorBySpeedStart, out Color colorBySpeedEnd);
+                    AddInputBlockColor4(set, idColorBySpeedStart, "Color by speed (start)", colorBySpeedStart.r, colorBySpeedStart.g, colorBySpeedStart.b, colorBySpeedStart.a, layout, LayoutColInputs, RowColorBySpeed);
+                    AddInputBlockColor4(set, idColorBySpeedEnd, "Color by speed (end)", colorBySpeedEnd.r, colorBySpeedEnd.g, colorBySpeedEnd.b, colorBySpeedEnd.a, layout, LayoutColInputs, RowColorBySpeedEnd);
+                    AddLerpBlock(set, idLerpColorBySpeed, "Lerp color by speed", idColorBySpeedStart, idColorBySpeedEnd, idClampNorm);
+                    layout.Loc(set, idLerpColorBySpeed, LayoutColRandomLerp, RowLerpColorBySpeed);
+                    idColorBySpeedSource = idLerpColorBySpeed;
+                }
                 var updateColorBySpeed = new UpdateColorBlockJson { customType = "BABYLON.UpdateColorBlock", id = idUpdateColorBySpeed, name = "Update color by speed" };
                 updateColorBySpeed.inputs.Add(Connection("particle", idUpdatePosition, "output"));
-                updateColorBySpeed.inputs.Add(Connection("color", idLerpColorBySpeed, "output"));
+                updateColorBySpeed.inputs.Add(Connection("color", idColorBySpeedSource, "output"));
                 updateColorBySpeed.outputs.Add(Out("output"));
                 set.blocks.Add(updateColorBySpeed);
-                AddLoc(set, idUpdateColorBySpeed, baseX + LayoutColUpdatePosition * LayoutStepX, baseY + 1940f);
+                layout.Loc(set, idUpdateColorBySpeed, LayoutColUpdatePosition, RowLerpColorBySpeed);
             }
 
             if (sizeBySpeed.enabled && !sizeOverLifetime.enabled)
             {
                 float sizeStart = sizeBySpeed.size.Evaluate(0f, 0f);
                 float sizeEnd = sizeBySpeed.size.Evaluate(1f, 0f);
-                AddInputBlock(set, idSizeBySpeedStart, "Size by speed (start)", sizeStart, baseX, baseY, LayoutColInputs, baseY + 2020f);
-                AddInputBlock(set, idSizeBySpeedEnd, "Size by speed (end)", sizeEnd, baseX, baseY, LayoutColInputs, baseY + 2100f);
+                AddInputBlock(set, idSizeBySpeedStart, "Size by speed (start)", sizeStart, layout, LayoutColInputs, RowSizeBySpeed);
+                AddInputBlock(set, idSizeBySpeedEnd, "Size by speed (end)", sizeEnd, layout, LayoutColInputs, RowSizeBySpeed + 1f);
                 AddLerpBlock(set, idLerpSizeBySpeed, "Lerp size by speed", idSizeBySpeedStart, idSizeBySpeedEnd, idClampNorm);
-                AddLoc(set, idLerpSizeBySpeed, baseX + LayoutColRandomLerp * LayoutStepX, baseY + 2060f);
+                layout.Loc(set, idLerpSizeBySpeed, LayoutColRandomLerp, RowLerpSizeBySpeed);
                 int chainHeadForSizeBySpeed = colorOverLifetime.enabled ? idUpdateColor : (colorBySpeed.enabled ? idUpdateColorBySpeed : idUpdatePosition);
                 var updateSizeBySpeed = new UpdateSizeBlockJson { customType = "BABYLON.UpdateSizeBlock", id = idUpdateSizeBySpeed, name = "Update size by speed" };
                 updateSizeBySpeed.inputs.Add(Connection("particle", chainHeadForSizeBySpeed, "output"));
                 updateSizeBySpeed.inputs.Add(Connection("size", idLerpSizeBySpeed, "output"));
                 updateSizeBySpeed.outputs.Add(Out("output"));
                 set.blocks.Add(updateSizeBySpeed);
-                AddLoc(set, idUpdateSizeBySpeed, baseX + LayoutColUpdatePosition * LayoutStepX, baseY + 2060f);
+                layout.Loc(set, idUpdateSizeBySpeed, LayoutColUpdatePosition, RowLerpSizeBySpeed);
             }
 
             if (rotationBySpeed.enabled && !rotationOverLifetime.enabled)
             {
                 float angleStart = rotationBySpeed.z.Evaluate(0f, 0f) * Mathf.Deg2Rad;
                 float angleEnd = rotationBySpeed.z.Evaluate(1f, 0f) * Mathf.Deg2Rad;
-                AddInputBlock(set, idAngleBySpeedStart, "Angle by speed (start)", angleStart, baseX, baseY, LayoutColInputs, baseY + 2140f);
-                AddInputBlock(set, idAngleBySpeedEnd, "Angle by speed (end)", angleEnd, baseX, baseY, LayoutColInputs, baseY + 2220f);
+                AddInputBlock(set, idAngleBySpeedStart, "Angle by speed (start)", angleStart, layout, LayoutColInputs, RowAngleBySpeed);
+                AddInputBlock(set, idAngleBySpeedEnd, "Angle by speed (end)", angleEnd, layout, LayoutColInputs, RowAngleBySpeed + 1f);
                 AddLerpBlock(set, idLerpAngleBySpeed, "Lerp angle by speed", idAngleBySpeedStart, idAngleBySpeedEnd, idClampNorm);
-                AddLoc(set, idLerpAngleBySpeed, baseX + LayoutColRandomLerp * LayoutStepX, baseY + 2180f);
+                layout.Loc(set, idLerpAngleBySpeed, LayoutColRandomLerp, RowLerpAngleBySpeed);
                 int chainHeadForAngleBySpeed = sizeOverLifetime.enabled ? idUpdateSize : (sizeBySpeed.enabled ? idUpdateSizeBySpeed : (colorOverLifetime.enabled ? idUpdateColor : (colorBySpeed.enabled ? idUpdateColorBySpeed : idUpdatePosition)));
                 var updateAngleBySpeed = new UpdateAngleBlockJson { customType = "BABYLON.UpdateAngleBlock", id = idUpdateAngleBySpeed, name = "Update angle by speed" };
                 updateAngleBySpeed.inputs.Add(Connection("particle", chainHeadForAngleBySpeed, "output"));
                 updateAngleBySpeed.inputs.Add(Connection("angle", idLerpAngleBySpeed, "output"));
                 updateAngleBySpeed.outputs.Add(Out("output"));
                 set.blocks.Add(updateAngleBySpeed);
-                AddLoc(set, idUpdateAngleBySpeed, baseX + LayoutColUpdatePosition * LayoutStepX, baseY + 2180f);
+                layout.Loc(set, idUpdateAngleBySpeed, LayoutColUpdatePosition, RowLerpAngleBySpeed);
             }
 
             // Add (Position + ScaledDirection)
@@ -658,7 +941,7 @@ namespace ShurikenToBabylonNpe
             addBlock.inputs.Add(Connection("left", idPosition, "output"));
             addBlock.inputs.Add(Connection("right", idScaledDir, "output"));
             addBlock.outputs.Add(Out("output"));
-            AddLoc(set, idAdd, baseX + LayoutColAdd * LayoutStepX, baseY + 1560f);
+            layout.Loc(set, idAdd, LayoutColAdd, RowAdd);
             set.blocks.Add(addBlock);
 
             var posInput = new ParticleInputBlockJson
@@ -675,7 +958,7 @@ namespace ShurikenToBabylonNpe
                 displayInInspector = true
             };
             posInput.outputs.Add(Out("output"));
-            AddLoc(set, idPosition, baseX + LayoutColPositionDir * LayoutStepX, baseY + 1520f);
+            layout.Loc(set, idPosition, LayoutColPositionDir, RowPosition);
             set.blocks.Add(posInput);
 
             var dirInput = new ParticleInputBlockJson
@@ -692,7 +975,7 @@ namespace ShurikenToBabylonNpe
                 displayInInspector = true
             };
             dirInput.outputs.Add(Out("output"));
-            AddLoc(set, idScaledDir, baseX + LayoutColPositionDir * LayoutStepX, baseY + 1600f);
+            layout.Loc(set, idScaledDir, LayoutColPositionDir, RowScaledDir);
             set.blocks.Add(dirInput);
 
             // CreateParticle
@@ -702,18 +985,20 @@ namespace ShurikenToBabylonNpe
                 id = idCreateParticle,
                 name = "Create particle"
             };
-            bool lifetimeConst = main.startLifetime.mode == ParticleSystemCurveMode.Constant;
-            bool emitPowerConst = main.startSpeed.mode == ParticleSystemCurveMode.Constant;
-            bool sizeConst = main.startSize.mode == ParticleSystemCurveMode.Constant;
+            bool lifetimeConst = exportLifetime.IsConstant;
+            bool emitPowerConst = exportEmitPower.IsConstant;
+            bool sizeConst = exportSize.IsConstant;
             bool scaleConst = true;
-            bool angleConst = main.startRotation.mode == ParticleSystemCurveMode.Constant;
+            bool angleConst = exportAngle.IsConstant;
             bool colorConst = main.startColor.mode == ParticleSystemGradientMode.Color;
+            bool colorTwoColors = main.startColor.mode == ParticleSystemGradientMode.TwoColors;
+            bool startColorGradientFallback = (startColorIsGradient && main.startColor.gradient == null) || (startColorIsTwoGradients && (main.startColor.gradient == null || main.startColor.gradientMax == null));
+            int idColorForCreate = colorConst ? idColor1 : (colorTwoColors || startColorGradientFallback ? idLerpColor : (startColorIsGradient ? idStartColorGradient : idLerpStartColorGradientsTwo));
             int idLifetimeForCreate = lifetimeConst ? idLifetimeMin : idRandomLifetime;
             int idEmitPowerForCreate = emitPowerConst ? idEmitPowerMin : idRandomEmitPower;
             int idSizeForCreate = sizeConst ? idSizeMin : idRandomSize;
             int idScaleForCreate = scaleConst ? idScaleMin : idRandomScale;
             int idAngleForCreate = angleConst ? idAngleMin : idRandomAngle;
-            int idColorForCreate = colorConst ? idColor1 : idLerpColor;
             createBlock.inputs.Add(Connection("lifeTime", idLifetimeForCreate, "output"));
             createBlock.inputs.Add(Connection("emitPower", idEmitPowerForCreate, "output"));
             createBlock.inputs.Add(Connection("size", idSizeForCreate, "output"));
@@ -722,68 +1007,91 @@ namespace ShurikenToBabylonNpe
             createBlock.inputs.Add(Connection("color", idColorForCreate, "output"));
             createBlock.inputs.Add(Connection("colorDead", idColorDead, "output"));
             createBlock.outputs.Add(Out("particle"));
-            AddLoc(set, idCreateParticle, baseX + LayoutColCreateParticle * LayoutStepX, baseY + 720f);
+            layout.Loc(set, idCreateParticle, LayoutColCreateParticle, RowFrame3);
             set.blocks.Add(createBlock);
 
             // Shape: Box, Sphere, Hemisphere, Cone, ConeVolume, Circle→Cylinder, else Point
-            AddShapeBlock(set, shape, idShape, idCreateParticle, baseX, baseY);
+            AddShapeBlock(set, shape, idShape, idCreateParticle, layout);
 
-            // Frame 0: Lifetime — Constant: one block; TwoConstants/Curve: Min, Max, Random
-            AddInputBlock(set, idLifetimeMin, lifetimeConst ? "Lifetime" : "Min Lifetime", minLife, baseX, baseY, LayoutColInputs, fy(0));
+            // Frame 0: Lifetime — Constant: one block; TwoConstants/Curve/TwoCurves: Min, Max, Random
+            AddInputBlock(set, idLifetimeMin, lifetimeConst ? "Lifetime" : "Min Lifetime", exportLifetime.MinValue, layout, LayoutColInputs, layout.FrameRow(0, 0));
             if (!lifetimeConst)
             {
-                AddInputBlock(set, idLifetimeMax, "Max Lifetime", maxLife, baseX, baseY, LayoutColInputs, fy(0) + LayoutStepY);
+                AddInputBlock(set, idLifetimeMax, "Max Lifetime", exportLifetime.MaxValue, layout, LayoutColInputs, layout.FrameRow(0, 1));
                 AddRandomBlock(set, idRandomLifetime, "Random Lifetime", idLifetimeMin, idLifetimeMax, LockPerParticle);
-                AddLoc(set, idRandomLifetime, baseX + LayoutColRandomLerp * LayoutStepX, baseY + fy(0) + LayoutStepY);
+                layout.Loc(set, idRandomLifetime, LayoutColRandomLerp, layout.FrameRow(0, 1));
             }
 
             // Frame 1: Emit Power
-            AddInputBlock(set, idEmitPowerMin, emitPowerConst ? "Emit Power" : "Min Emit Power", minSpeed, baseX, baseY, LayoutColInputs, fy(1));
+            AddInputBlock(set, idEmitPowerMin, emitPowerConst ? "Emit Power" : "Min Emit Power", exportEmitPower.MinValue, layout, LayoutColInputs, layout.FrameRow(1, 0));
             if (!emitPowerConst)
             {
-                AddInputBlock(set, idEmitPowerMax, "Max Emit Power", maxSpeed, baseX, baseY, LayoutColInputs, fy(1) + LayoutStepY);
+                AddInputBlock(set, idEmitPowerMax, "Max Emit Power", exportEmitPower.MaxValue, layout, LayoutColInputs, layout.FrameRow(1, 1));
                 AddRandomBlock(set, idRandomEmitPower, "Random Emit Power", idEmitPowerMin, idEmitPowerMax, LockPerParticle);
-                AddLoc(set, idRandomEmitPower, baseX + LayoutColRandomLerp * LayoutStepX, baseY + fy(1) + LayoutStepY);
+                layout.Loc(set, idRandomEmitPower, LayoutColRandomLerp, layout.FrameRow(1, 1));
             }
 
             // Frame 2: Size
-            AddInputBlock(set, idSizeMin, sizeConst ? "Size" : "Min size", minSize, baseX, baseY, LayoutColInputs, fy(2));
+            AddInputBlock(set, idSizeMin, sizeConst ? "Size" : "Min size", exportSize.MinValue, layout, LayoutColInputs, layout.FrameRow(2, 0));
             if (!sizeConst)
             {
-                AddInputBlock(set, idSizeMax, "Max size", maxSize, baseX, baseY, LayoutColInputs, fy(2) + LayoutStepY);
+                AddInputBlock(set, idSizeMax, "Max size", exportSize.MaxValue, layout, LayoutColInputs, layout.FrameRow(2, 1));
                 AddRandomBlock(set, idRandomSize, "Random size", idSizeMin, idSizeMax, LockPerParticle);
-                AddLoc(set, idRandomSize, baseX + LayoutColRandomLerp * LayoutStepX, baseY + fy(2) + LayoutStepY);
+                layout.Loc(set, idRandomSize, LayoutColRandomLerp, layout.FrameRow(2, 1));
             }
 
             // Frame 3: Scale (we export as constant 1,1)
-            AddInputBlockVector2(set, idScaleMin, "Scale", 1, 1, baseX, baseY, LayoutColInputs, fy(3));
+            AddInputBlockVector2(set, idScaleMin, "Scale", 1, 1, layout, LayoutColInputs, layout.FrameRow(3, 0));
             if (!scaleConst)
             {
-                AddInputBlockVector2(set, idScaleMax, "Max Scale", 1, 1, baseX, baseY, LayoutColInputs, fy(3) + LayoutStepY);
+                AddInputBlockVector2(set, idScaleMax, "Max Scale", 1, 1, layout, LayoutColInputs, layout.FrameRow(3, 1));
                 AddRandomBlock(set, idRandomScale, "Random Scale", idScaleMin, idScaleMax, LockPerParticle);
-                AddLoc(set, idRandomScale, baseX + LayoutColRandomLerp * LayoutStepX, baseY + fy(3) + LayoutStepY);
+                layout.Loc(set, idRandomScale, LayoutColRandomLerp, layout.FrameRow(3, 1));
             }
 
             // Frame 4: Angle
-            AddInputBlock(set, idAngleMin, angleConst ? "Rotation" : "Min Rotation", minRot, baseX, baseY, LayoutColInputs, fy(4));
+            AddInputBlock(set, idAngleMin, angleConst ? "Rotation" : "Min Rotation", exportAngle.MinValue, layout, LayoutColInputs, layout.FrameRow(4, 0));
             if (!angleConst)
             {
-                AddInputBlock(set, idAngleMax, "Max Rotation", maxRot, baseX, baseY, LayoutColInputs, fy(4) + LayoutStepY);
+                AddInputBlock(set, idAngleMax, "Max Rotation", exportAngle.MaxValue, layout, LayoutColInputs, layout.FrameRow(4, 1));
                 AddRandomBlock(set, idRandomAngle, "Random Rotation", idAngleMin, idAngleMax, LockPerParticle);
-                AddLoc(set, idRandomAngle, baseX + LayoutColRandomLerp * LayoutStepX, baseY + fy(4) + LayoutStepY);
+                layout.Loc(set, idRandomAngle, LayoutColRandomLerp, layout.FrameRow(4, 1));
             }
 
-            // Frame 5: Color — Constant: one block; else Color1, Color2, Random step, Lerp. ColorDead always one block.
-            AddInputBlockColor4(set, idColor1, colorConst ? "Start Color" : "Color 1", c1.r, c1.g, c1.b, c1.a, baseX, baseY, LayoutColInputs, fy(5));
-            if (!colorConst)
+            // Frame 5: Color — Color: one block; TwoColors: Color1, Color2, Random, Lerp; Gradient: Random(0,1) + gradient block; TwoGradients: two gradient blocks + Lerp; fallback: Lerp(c1,c2). ColorDead always one block.
+            if (colorConst || colorTwoColors || startColorGradientFallback)
+                AddInputBlockColor4(set, idColor1, colorConst ? "Start Color" : "Color 1", c1.r, c1.g, c1.b, c1.a, layout, LayoutColInputs, layout.FrameRow(5, 0));
+            if (colorTwoColors || startColorGradientFallback)
             {
-                AddInputBlockColor4(set, idColor2, "Color 2", c2.r, c2.g, c2.b, c2.a, baseX, baseY, LayoutColInputs, fy(5) + LayoutStepY);
+                AddInputBlockColor4(set, idColor2, "Color 2", c2.r, c2.g, c2.b, c2.a, layout, LayoutColInputs, layout.FrameRow(5, 1));
                 AddRandomBlock(set, idColorStep, "Random color step", 0, 1, LockOncePerParticle);
-                AddLoc(set, idColorStep, baseX + LayoutColInputs * LayoutStepX, baseY + fy(5) + 2 * LayoutStepY);
+                layout.Loc(set, idColorStep, LayoutColInputs, layout.FrameRow(5, 2));
                 AddLerpBlock(set, idLerpColor, "Lerp color", idColor1, idColor2, idColorStep);
-                AddLoc(set, idLerpColor, baseX + LayoutColRandomLerp * LayoutStepX, baseY + fy(5) + LayoutStepY);
+                layout.Loc(set, idLerpColor, LayoutColRandomLerp, layout.FrameRow(5, 1));
             }
-            AddInputBlockColor4(set, idColorDead, "Dead Color", cDead.r, cDead.g, cDead.b, cDead.a, baseX, baseY, LayoutColInputs, fy(5) + (colorConst ? 1 : 3) * LayoutStepY);
+            else if (startColorIsGradient && main.startColor.gradient != null)
+            {
+                AddInputBlock(set, idStartColorRandMin, "Start color grad min", 0f, layout, LayoutColInputs, layout.FrameRow(5, 1));
+                AddInputBlock(set, idStartColorRandMax, "Start color grad max", 1f, layout, LayoutColInputs, layout.FrameRow(5, 2));
+                AddRandomBlock(set, idRandomStartColorPos, "Random start color pos", idStartColorRandMin, idStartColorRandMax, LockOncePerParticle);
+                layout.Loc(set, idRandomStartColorPos, LayoutColInputs, layout.FrameRow(5, 3));
+                AddColorGradientBlockGroup(set, main.startColor.gradient, idRandomStartColorPos, ref nextId, layout, LayoutColInputs, layout.FrameRow(5, 1), "Start color", idStartColorGradient);
+            }
+            else if (startColorIsTwoGradients && main.startColor.gradient != null && main.startColor.gradientMax != null)
+            {
+                AddInputBlock(set, idStartColorRandMin, "Start color grad min", 0f, layout, LayoutColInputs, layout.FrameRow(5, 1));
+                AddInputBlock(set, idStartColorRandMax, "Start color grad max", 1f, layout, LayoutColInputs, layout.FrameRow(5, 2));
+                AddRandomBlock(set, idRandomStartColorPos, "Random start color pos", idStartColorRandMin, idStartColorRandMax, LockOncePerParticle);
+                layout.Loc(set, idRandomStartColorPos, LayoutColInputs, layout.FrameRow(5, 3));
+                AddColorGradientBlockGroup(set, main.startColor.gradient, idRandomStartColorPos, ref nextId, layout, LayoutColInputs, layout.FrameRow(5, 1), "Start color 1", idStartColorGradient);
+                AddColorGradientBlockGroup(set, main.startColor.gradientMax, idRandomStartColorPos, ref nextId, layout, LayoutColInputs + 2, layout.FrameRow(5, 1), "Start color 2", idStartColorGradient2);
+                AddRandomBlock(set, idRandomStartColorWhich, "Random which start gradient", idStartColorRandMin, idStartColorRandMax, LockOncePerParticle);
+                layout.Loc(set, idRandomStartColorWhich, LayoutColInputs, layout.FrameRow(5, 4));
+                AddLerpBlock(set, idLerpStartColorGradientsTwo, "Lerp start color gradients", idStartColorGradient, idStartColorGradient2, idRandomStartColorWhich);
+                layout.Loc(set, idLerpStartColorGradientsTwo, LayoutColRandomLerp, layout.FrameRow(5, 2));
+            }
+            int colorFrameRows = colorConst ? 1 : (colorTwoColors || startColorGradientFallback ? 3 : (startColorIsGradient ? 4 : (startColorIsTwoGradients ? 5 : 3)));
+            AddInputBlockColor4(set, idColorDead, "Dead Color", cDead.r, cDead.g, cDead.b, cDead.a, layout, LayoutColInputs, layout.FrameRow(5, 0) + colorFrameRows);
 
             // Texture: serialize to base64 data URL when possible (NPE textureDataUrl)
             string textureDataUrl = GetTextureDataUrl(tex);
@@ -798,7 +1106,7 @@ namespace ShurikenToBabylonNpe
                 textureDataUrl = textureDataUrl
             };
             texBlock.outputs.Add(Out("texture"));
-            AddLoc(set, idTexture, baseX + LayoutColTexture * LayoutStepX, baseY + 800f);
+            layout.Loc(set, idTexture, LayoutColTexture, RowTexture);
             set.blocks.Add(texBlock);
         }
 
@@ -815,16 +1123,14 @@ namespace ShurikenToBabylonNpe
         }
 
         /// <summary>Add the correct shape block for Unity shape.type: Box, Sphere, Hemisphere, Cone, ConeVolume, Circle→Cylinder, else Point.</summary>
-        static void AddShapeBlock(NodeParticleSystemSetJson set, ParticleSystem.ShapeModule shape, int idShape, int idCreateParticle, float baseX, float baseY)
+        static void AddShapeBlock(NodeParticleSystemSetJson set, ParticleSystem.ShapeModule shape, int idShape, int idCreateParticle, NpeLayout layout)
         {
-            float shapeX = baseX + LayoutColShape * LayoutStepX;
-            float shapeY = baseY + 720f;
             void FinishShape(BlockJson block)
             {
                 block.inputs.Insert(0, Connection("particle", idCreateParticle, "particle"));
                 block.outputs.Add(Out("output"));
                 set.blocks.Add(block);
-                AddLoc(set, idShape, shapeX, shapeY);
+                layout.Loc(set, idShape, LayoutColShape, RowFrame3);
             }
 
             switch (shape.shapeType)
@@ -845,8 +1151,7 @@ namespace ShurikenToBabylonNpe
                     sphere.inputs.Add(ValueInput("radius", radiusS));
                     sphere.inputs.Add(ValueInput("radiusRange", radiusRangeS));
                     sphere.inputs.Add(ValueInput("directionRandomizer", 0f));
-                    sphere.inputs.Add(ValueVector3("direction1", 0, 1, 0));
-                    sphere.inputs.Add(ValueVector3("direction2", 0, 1, 0));
+                    // Do not set direction1/direction2: NPE then uses radial direction (center→particle), so negative emitPower = inward
                     FinishShape(sphere);
                     break;
                 case ParticleSystemShapeType.Hemisphere:
@@ -856,8 +1161,7 @@ namespace ShurikenToBabylonNpe
                     hemi.inputs.Add(ValueInput("radius", radiusH));
                     hemi.inputs.Add(ValueInput("radiusRange", radiusRangeH));
                     hemi.inputs.Add(ValueInput("directionRandomizer", 0f));
-                    hemi.inputs.Add(ValueVector3("direction1", 0, 1, 0));
-                    hemi.inputs.Add(ValueVector3("direction2", 0, 1, 0));
+                    // Do not set direction1/direction2: NPE uses radial direction
                     FinishShape(hemi);
                     break;
                 case ParticleSystemShapeType.Cone:
@@ -944,6 +1248,11 @@ namespace ShurikenToBabylonNpe
             AddLoc(set, id, baseX + colIndex * LayoutStepX, baseY + yOffset);
         }
 
+        static void AddInputBlock(NodeParticleSystemSetJson set, int id, string name, float value, NpeLayout layout, int col, float row)
+        {
+            AddInputBlock(set, id, name, value, layout.BaseX, layout.BaseY, col, row * LayoutStepY);
+        }
+
         static void AddInputBlockVector2(NodeParticleSystemSetJson set, int id, string name, float x, float y, float baseX, float baseY, int colIndex, float yOffset)
         {
             var b = new ParticleInputBlockJson
@@ -966,6 +1275,11 @@ namespace ShurikenToBabylonNpe
             AddLoc(set, id, baseX + colIndex * LayoutStepX, baseY + yOffset);
         }
 
+        static void AddInputBlockVector2(NodeParticleSystemSetJson set, int id, string name, float x, float y, NpeLayout layout, int col, float row)
+        {
+            AddInputBlockVector2(set, id, name, x, y, layout.BaseX, layout.BaseY, col, row * LayoutStepY);
+        }
+
         static void AddInputBlockColor4(NodeParticleSystemSetJson set, int id, string name, float r, float g, float b, float a, float baseX, float baseY, int colIndex, float yOffset)
         {
             var block = new ParticleInputBlockJson
@@ -986,6 +1300,11 @@ namespace ShurikenToBabylonNpe
             block.outputs.Add(Out("output"));
             set.blocks.Add(block);
             AddLoc(set, id, baseX + colIndex * LayoutStepX, baseY + yOffset);
+        }
+
+        static void AddInputBlockColor4(NodeParticleSystemSetJson set, int id, string name, float r, float g, float b, float a, NpeLayout layout, int col, float row)
+        {
+            AddInputBlockColor4(set, id, name, r, g, b, a, layout.BaseX, layout.BaseY, col, row * LayoutStepY);
         }
 
         static void AddRandomBlock(NodeParticleSystemSetJson set, int id, string name, int idMin, int idMax, int lockMode)

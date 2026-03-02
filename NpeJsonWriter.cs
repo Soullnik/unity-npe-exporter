@@ -150,6 +150,14 @@ namespace ShurikenToBabylonNpe
                 Prop(sb, "minimum", clamp.minimum, ind);
                 Prop(sb, "maximum", clamp.maximum, ind);
             }
+            else if (b is ParticleGradientValueBlockJson gradVal)
+            {
+                Prop(sb, "reference", gradVal.reference, ind);
+            }
+            else if (b is ParticleGradientBlockJson grad)
+            {
+                Prop(sb, "_entryCount", grad._entryCount, ind);
+            }
 
             if (ind != null) ind--;
             sb.Append(ind != null ? "\n}" : "}");

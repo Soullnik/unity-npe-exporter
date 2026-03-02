@@ -142,6 +142,20 @@ namespace BabylonNodeParticle
     public class ParticleLerpBlockJson : BlockJson { }
 
     [Serializable]
+    public class ParticleGradientBlockJson : BlockJson
+    {
+        public int _entryCount = 1;
+    }
+
+    /// <summary>One color stop in a gradient. reference = position on gradient 0..1 (key time); value input = color at this key.</summary>
+    [Serializable]
+    public class ParticleGradientValueBlockJson : BlockJson
+    {
+        /// <summary>Gradient key position 0..1 for this stop. Serialized as number in JSON.</summary>
+        public float reference;
+    }
+
+    [Serializable]
     public class UpdatePositionBlockJson : BlockJson { }
 
     [Serializable]
